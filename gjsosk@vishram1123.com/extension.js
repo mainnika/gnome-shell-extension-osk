@@ -1416,6 +1416,7 @@ class Keyboard extends Dialog {
                         }, this.settings.get_int("key-repeat-rate"));
                     }, 750);
                 } else if (item.has_style_class_name("space_btn")) {
+                    item.key_pressed = true;
                     item.button_pressed = setTimeout(() => {
                         let lastPos = (item.get_transformed_position()[0] + item.get_transformed_size()[0] / 2)
                         let handleSpaceMotion = absX => {
