@@ -619,9 +619,14 @@ class Keyboard extends Dialog {
         this.keymap = Clutter.get_default_backend().get_default_seat().get_keymap()
         this.capslockConnect = 0;
         this.numLockConnect = 0;
+        this.lockStateUpdateId = 0;
+        this.capsLockButton = null;
+        this.numLockButton = null;
+        this._destroyed = false;
         this.mod = [];
         this.modBtns = [];
         this.capsL = false;
+        this.numsL = false;
         this.shift = false;
         this.alt = false;
         this.fn = false;       // FN layer toggle (media keys ↔ F1-F12)
@@ -744,6 +749,11 @@ class Keyboard extends Dialog {
         if (this.keyTimeout !== null) {
             this.finishKeyPress();
         }
+        if (this.lockStateUpdateId) {
+            GLib.source_remove(this.lockStateUpdateId);
+            this.lockStateUpdateId = 0;
+        }
+        this._destroyed = true;
         if (this.keymap != null && this.capslockConnect)
             this.keymap.disconnect(this.capslockConnect);
         if (this.keymap != null && this.numLockConnect)
@@ -1228,15 +1238,17 @@ class Keyboard extends Dialog {
                 keyBtn.add_style_class_name('key')
                 keyBtn.char = i
                 if (i.code === KeyCode.CAPS_LOCK) {
+                    this.capsLockButton = keyBtn;
                     this.capslockConnect = this.keymap.connect("state-changed", (a, e) => {
-                        this.setCapsLock(keyBtn, this.keymap.get_caps_lock_state())
+                        this.queueLockStateUpdate();
                     })
-                    this.updateCapsLock = () => this.setCapsLock(keyBtn, this.keymap.get_caps_lock_state())
+                    this.updateCapsLock = () => this.syncLockState()
                 } else if (i.code === KeyCode.NUM_LOCK) {
+                    this.numLockButton = keyBtn;
                     this.numLockConnect = this.keymap.connect("state-changed", (a, e) => {
-                        this.setNumLock(keyBtn, this.keymap.get_num_lock_state())
+                        this.queueLockStateUpdate();
                     })
-                    this.updateNumLock = () => this.setNumLock(keyBtn, this.keymap.get_num_lock_state())
+                    this.updateNumLock = () => this.syncLockState()
                 } else if (i.code === KeyCode.LEFT_SHIFT || i.code === KeyCode.RIGHT_SHIFT) {
                     this.shiftButtons.push(keyBtn)
                 }
@@ -1774,36 +1786,43 @@ class Keyboard extends Dialog {
         }
     }
 
+    queueLockStateUpdate() {
+        if (this._destroyed || this.lockStateUpdateId)
+            return;
+
+        this.lockStateUpdateId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this.lockStateUpdateId = 0;
+            this.syncLockState();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    syncLockState() {
+        if (this._destroyed || this.keymap == null)
+            return;
+
+        this.setCapsLock(this.capsLockButton, this.keymap.get_caps_lock_state());
+        this.setNumLock(this.numLockButton, this.keymap.get_num_lock_state());
+    }
+
     setCapsLock(button, state) {
-        try {
-            if (button && button.get_stage && button.get_stage()) {
-                if (state) {
-                    button.add_style_class_name("selected");
-                    this.capsL = true;
-                } else {
-                    button.remove_style_class_name("selected");
-                    this.capsL = false;
-                }
-            } else {
-                this.capsL = !!state;
-            }
-        } catch (e) {
-            this.capsL = !!state;
+        this.capsL = !!state;
+        if (button && button.get_stage && button.get_stage()) {
+            if (this.capsL)
+                button.add_style_class_name("selected");
+            else
+                button.remove_style_class_name("selected");
         }
-        try {
-            this.updateKeyLabels();
-        } catch (e) {
-            logError(e, 'GJS-OSK: updateKeyLabels failed in setCapsLock');
-        }
+        this.updateKeyLabels();
     }
 
     setNumLock(button, state) {
-        if (state) {
-            button.add_style_class_name("selected");
-            this.numsL = true;
-        } else {
-            button.remove_style_class_name("selected");
-            this.numsL = false;
+        this.numsL = !!state;
+        if (button && button.get_stage && button.get_stage()) {
+            if (this.numsL)
+                button.add_style_class_name("selected");
+            else
+                button.remove_style_class_name("selected");
         }
         this.updateKeyLabels();
     }
@@ -1842,25 +1861,25 @@ class Keyboard extends Dialog {
 
     updateKeyLabels() {
         this.keys.forEach(key => {
-            try {
-                if (key.char == undefined) return;
-                if (key.char.mediaData) {
-                    if (this.fn) {
-                        // FN active: show F-key label (FK01 → F1, etc.)
-                        const fkeyNum = parseInt((key.char.keyName || '').substring(2)) || '';
-                        key.label = fkeyNum ? `F${fkeyNum}` : (key.char.layers?.default || '');
-                    } else {
-                        // FN inactive: show media label
-                        key.label = key.char.mediaData.label || key.char.layers?.default || '';
-                    }
+            if (key.char == undefined) return;
+            let label = null;
+            if (key.char.mediaData) {
+                if (this.fn) {
+                    // FN active: show F-key label (FK01 → F1, etc.)
+                    const fkeyNum = parseInt((key.char.keyName || '').substring(2)) || '';
+                    label = fkeyNum ? `F${fkeyNum}` : key.char.layers?.default;
                 } else {
-                    let layer = (this.alt ? 'alt' : '') + (this.shift ? 'shift' : '') + (this.numsL ? 'num' : '') + (this.capsL ? 'caps' : '') + (this.numsL || this.capsL ? 'lock' : '')
-                    if (layer == '') layer = 'default'
-                    key.label = key.char.layers[layer];
+                    // FN inactive: show media label
+                    label = key.char.mediaData.label || key.char.layers?.default;
                 }
-            } catch (e) {
-                logError(e, 'GJS-OSK: error updating key label');
+            } else {
+                let layer = (this.alt ? 'alt' : '') + (this.shift ? 'shift' : '') + (this.numsL ? 'num' : '') + (this.capsL ? 'caps' : '') + (this.numsL || this.capsL ? 'lock' : '')
+                if (layer == '') layer = 'default'
+                label = key.char.layers?.[layer] ?? key.char.layers?.default;
             }
+
+            if (typeof label === 'string')
+                key.label = label;
         });
     }
 
