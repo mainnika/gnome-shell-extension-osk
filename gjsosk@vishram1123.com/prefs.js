@@ -9,6 +9,21 @@ import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/
 import * as Config from 'resource:///org/gnome/Shell/Extensions/js/misc/config.js'
 const [major, minor] = Config.PACKAGE_VERSION.split('.').map(s => Number(s));
 
+function clampIndex(index, length) {
+	if (!Number.isFinite(index) || index < 0 || index >= length)
+		return 0;
+	return index;
+}
+
+function readFileContents(path) {
+	try {
+		const [ok, contents] = GLib.file_get_contents(path);
+		return ok ? contents : null;
+	} catch {
+		return null;
+	}
+}
+
 export default class GjsOskPreferences extends ExtensionPreferences {
 	fillPreferencesWindow(window) {
 		const UIFolderPath = this.dir.get_child('ui').get_path();
@@ -32,21 +47,30 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		});
 		behaviorGroup.add(layoutRow);
 
+		let layouts;
+		let contentsL = readFileContents(this.path + '/physicalLayouts.json');
+		if (contentsL != null) {
+			layouts = JSON.parse(contentsL);
+		} else {
+			layouts = {};
+		}
+
+		let layoutList = Object.keys(layouts);
+		if (layoutList.length == 0)
+			layoutList = [_("Default")];
+
 		const layoutLandscapeRow = new Adw.ActionRow({
 			title: _('Landscape Layout')
 		});
 		layoutRow.add_row(layoutLandscapeRow);
 
-		let layouts;
-		let [okL, contentsL] = GLib.file_get_contents(this.path + '/physicalLayouts.json');
-		if (okL) {
-			layouts = JSON.parse(contentsL);
-		}
-
-		let layoutList = Object.keys(layouts);
 		let layoutLandscapeDrop = Gtk.DropDown.new_from_strings(layoutList);
 		layoutLandscapeDrop.valign = Gtk.Align.CENTER;
-		layoutLandscapeDrop.selected = settings.get_int("layout-landscape");
+		layoutLandscapeDrop.sensitive = Object.keys(layouts).length > 0;
+		let layoutLandscapeIndex = clampIndex(settings.get_int("layout-landscape"), layoutList.length);
+		layoutLandscapeDrop.selected = layoutLandscapeIndex;
+		if (layoutLandscapeIndex != settings.get_int("layout-landscape"))
+			settings.set_int("layout-landscape", layoutLandscapeIndex);
 
 		layoutLandscapeRow.add_suffix(layoutLandscapeDrop);
 		layoutLandscapeRow.activatable_widget = layoutLandscapeDrop;
@@ -58,7 +82,11 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 
 		let layoutPortraitDrop = Gtk.DropDown.new_from_strings(layoutList);
 		layoutPortraitDrop.valign = Gtk.Align.CENTER;
-		layoutPortraitDrop.selected = settings.get_int("layout-portrait");
+		layoutPortraitDrop.sensitive = Object.keys(layouts).length > 0;
+		let layoutPortraitIndex = clampIndex(settings.get_int("layout-portrait"), layoutList.length);
+		layoutPortraitDrop.selected = layoutPortraitIndex;
+		if (layoutPortraitIndex != settings.get_int("layout-portrait"))
+			settings.set_int("layout-portrait", layoutPortraitIndex);
 
 		layoutPortraitRow.add_suffix(layoutPortraitDrop);
 		layoutPortraitRow.activatable_widget = layoutPortraitDrop;
@@ -173,25 +201,26 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 				monitors.push(monitor);
 			}
 		}
-		let monitorDrop = Gtk.DropDown.new_from_strings(monitors.map(m => m.get_model()))
+		const monitorConnectors = monitors.map(m => m.get_connector());
+		let monitorDrop = Gtk.DropDown.new_from_strings(monitors.length > 0 ? monitors.map(m => m.get_model()) : [_("Default")])
 		monitorDrop.valign = Gtk.Align.CENTER;
+		monitorDrop.sensitive = monitors.length > 0;
 		let currentMonitorMap = {};
-		let currentMonitors;
-		if (settings.get_string("default-monitor").includes(";")) {
-			currentMonitors = settings.get_string("default-monitor").split(";")
-		} else {
-			currentMonitors = [("1:" + monitors[0].get_connector())]
-		}
+		let currentMonitors = settings.get_string("default-monitor").split(";").filter(i => i.includes(":"));
+		if (currentMonitors.length == 0 && monitors.length > 0)
+			currentMonitors = [("1:" + monitorConnectors[0])]
 
 		for (var i of currentMonitors) {
 			let tmp = i.split(":");
-			currentMonitorMap[tmp[0]] = tmp[1] + "";
+			if (tmp[0] !== "" && tmp[1] !== "")
+				currentMonitorMap[tmp[0]] = tmp[1] + "";
 		}
 		if (!Object.keys(currentMonitorMap).includes(monitors.length + "")) {
-			let allConfigs = Object.keys(currentMonitorMap).map(Number.parseInt).sort();
-			currentMonitorMap[monitors.length + ""] = allConfigs[allConfigs.length - 1];
+			let allConfigs = Object.keys(currentMonitorMap).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+			if (allConfigs.length > 0)
+				currentMonitorMap[monitors.length + ""] = currentMonitorMap[allConfigs[allConfigs.length - 1] + ""];
 		}
-		let index = monitors.map(m => { return m.get_connector() }).indexOf(currentMonitorMap[monitors.length + ""]);
+		let index = monitorConnectors.indexOf(currentMonitorMap[monitors.length + ""]);
 		if (index == -1) {
 			index = 0
 		}
@@ -475,14 +504,18 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		settings.bind("play-sound", soundPlayDT, "active", 0);
 		settings.bind("show-icons", showIconDT, "active", 0)
 		settings.bind("default-snap", snapDrop, "selected", 0);
-		monitorDrop.connect("notify::selected", () => {
-			currentMonitorMap[monitors.length + ""] = monitors.map(m => { return m.get_connector() })[monitorDrop.selected];
+		const writeMonitorSetting = () => {
+			if (monitors.length == 0)
+				return;
+
+			currentMonitorMap[monitors.length + ""] = monitorConnectors[monitorDrop.selected] ?? monitorConnectors[0];
 			let representation = [];
 			for (var k of Object.keys(currentMonitorMap)) {
 				representation.push(k + ":" + currentMonitorMap[k])
 			}
 			settings.set_string("default-monitor", representation.join(";"))
-		})
+		}
+		monitorDrop.connect("notify::selected", writeMonitorSetting)
 		systemAccColEnabled.connect("state-set", () => {
 			settings.set_boolean("system-accent-col", systemAccColEnabled.active)
 			lightCol.set_sensitive(!settings.get_boolean("system-accent-col"));
@@ -516,12 +549,7 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 			settings.set_boolean("play-sound", soundPlayDT.active);
 			settings.set_boolean("show-icons", showIconDT.active)
 			settings.set_int("default-snap", snapDrop.selected);
-			currentMonitorMap[monitors.length + ""] = monitors.map(m => { return m.get_connector() })[monitorDrop.selected];
-			let representation = [];
-			for (var k of Object.keys(currentMonitorMap)) {
-				representation.push(k + ":" + currentMonitorMap[k])
-			}
-			settings.set_string("default-monitor", representation.join(";"))
+			writeMonitorSetting()
 			settings.set_boolean("system-accent-col", systemAccColEnabled.active)
 		})
 	}

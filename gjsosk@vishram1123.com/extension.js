@@ -6,7 +6,6 @@ import St from 'gi://St';
 import Shell from 'gi://Shell';
 
 
-import * as EdgeDragAction from 'resource:///org/gnome/shell/ui/edgeDragAction.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -78,20 +77,54 @@ let currentMonitorId = 0;
 let extract_dir = GLib.get_user_cache_dir() + "/gjs-osk";
 // [insert handwriting 1]
 
+function clampIndex(index, length) {
+    if (!Number.isFinite(index) || index < 0 || index >= length)
+        return 0;
+    return index;
+}
+
+function readFileContents(path) {
+    try {
+        const [ok, contents] = GLib.file_get_contents(path);
+        return ok ? contents : null;
+    } catch {
+        return null;
+    }
+}
+
+function getCurrentMonitor() {
+    const monitors = Main.layoutManager.monitors ?? [];
+    return monitors[currentMonitorId] ??
+        Main.layoutManager.primaryMonitor ??
+        monitors[Main.layoutManager.primaryIndex] ??
+        monitors[0] ??
+        {
+            x: 0,
+            y: 0,
+            width: global.screen_width ?? 1,
+            height: global.screen_height ?? 1,
+        };
+}
+
 export default class GjsOskExtension extends Extension {
     _openKeyboard(instant) {
-        if (this.Keyboard.state == State.CLOSED) {
+        if (this.Keyboard != null && this.Keyboard.state == State.CLOSED) {
             this.Keyboard.open(null, !instant ? null : true);
         }
     }
 
     _closeKeyboard(instant) {
-        if (this.Keyboard.state == State.OPENED) {
+        if (this.Keyboard != null && this.Keyboard.state == State.OPENED) {
             this.Keyboard.close(!instant ? null : true);
         }
     }
 
     _toggleKeyboard(instant = false) {
+        if (this.Keyboard == null) {
+            this._pendingToggle = true;
+            return;
+        }
+
         if (!this.Keyboard.opened) {
             this._openKeyboard(instant);
             this.Keyboard.openedFromButton = true;
@@ -103,8 +136,28 @@ export default class GjsOskExtension extends Extension {
         }
     }
 
+    _createIndicator() {
+        const indicator = new PanelMenu.Button(0.0, "GJS OSK Indicator", true);
+        const icon = new St.Icon({
+            gicon: new Gio.ThemedIcon({
+                name: 'input-keyboard-symbolic'
+            }),
+            style_class: 'system-status-icon'
+        });
+        indicator.add_child(icon);
+
+        const clickGesture = new Clutter.ClickGesture();
+        clickGesture.connect('recognize', () => this._toggleKeyboard());
+        indicator.add_action(clickGesture);
+
+        return indicator;
+    }
+
     open_interval() {
-        global.stage.disconnect(this.tapConnect)
+        if (this.tapConnect) {
+            global.stage.disconnect(this.tapConnect)
+            this.tapConnect = 0;
+        }
         if (this.openInterval !== null) {
             clearInterval(this.openInterval);
             this.openInterval = null;
@@ -114,7 +167,9 @@ export default class GjsOskExtension extends Extension {
                 if (global.stage.key_focus == this.Keyboard && this.Keyboard.prevKeyFocus != null) {
                     global.stage.key_focus = this.Keyboard.prevKeyFocus
                 }
-                this.Keyboard.get_parent().set_child_at_index(this.Keyboard, this.Keyboard.get_parent().get_n_children() - 1);
+                const parent = this.Keyboard.get_parent();
+                if (parent != null)
+                    parent.set_child_at_index(this.Keyboard, parent.get_n_children() - 1);
                 this.Keyboard.set_child_at_index(this.Keyboard.box, this.Keyboard.get_n_children() - 1);
                 if (!this.Keyboard.openedFromButton && this.lastInputMethod) {
                     if (Main.inputMethod.currentFocus != null && Main.inputMethod.currentFocus.is_focused() && !this.Keyboard.closedFromButton) {
@@ -136,6 +191,15 @@ export default class GjsOskExtension extends Extension {
     }
 
     enable() {
+        this._extensionActive = true;
+        this._pendingToggle = false;
+        this._refreshSerial = 0;
+        this._restoreOpenAfterRefresh = false;
+        this._inputSourceRefreshTimeout = 0;
+        this.Keyboard = null;
+        this.openInterval = null;
+        this.tapConnect = 0;
+
         this.settings = this.getSettings();
         this.darkSchemeSettings = this.getSettings("org.gnome.desktop.interface");
         this.inputLanguageSettings = InputSourceManager.getInputSourceManager();
@@ -152,75 +216,93 @@ export default class GjsOskExtension extends Extension {
 
         this.openPrefs = () => { this.openPreferences() }
 
-        let [okL, contentsL] = GLib.file_get_contents(this.path + '/physicalLayouts.json');
-        if (okL) {
+        let contentsL = readFileContents(this.path + '/physicalLayouts.json');
+        if (contentsL != null) {
             layouts = JSON.parse(contentsL);
+        } else {
+            logError(new Error("Could not load physicalLayouts.json"));
+            return;
         }
 
         let refresh = () => {
+            if (!this._extensionActive)
+                return;
+
+            const refreshSerial = ++this._refreshSerial;
             // [insert handwriting 2]
-            let currentMonitors = this.settings.get_string("default-monitor").split(";")
+            let currentMonitors = this.settings.get_string("default-monitor").split(";").filter(i => i.includes(":"))
             let currentMonitorMap = {};
-            let monitors = Main.layoutManager.monitors;
+            let monitors = Main.layoutManager.monitors ?? [];
             for (var i of currentMonitors) {
                 let tmp = i.split(":");
-                currentMonitorMap[tmp[0]] = tmp[1] + "";
+                if (tmp[0] !== "" && tmp[1] !== "")
+                    currentMonitorMap[tmp[0]] = tmp[1] + "";
             }
             if (!Object.keys(currentMonitorMap).includes(monitors.length + "")) {
-                let allConfigs = Object.keys(currentMonitorMap).map(Number.parseInt).sort();
-                currentMonitorMap[monitors.length + ""] = allConfigs[allConfigs.length - 1];
+                let allConfigs = Object.keys(currentMonitorMap).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+                if (allConfigs.length > 0)
+                    currentMonitorMap[monitors.length + ""] = currentMonitorMap[allConfigs[allConfigs.length - 1] + ""];
             }
             try {
-                currentMonitorId = global.backend.get_monitor_manager().get_monitor_for_connector(currentMonitorMap[monitors.length + ""]);
-                if (currentMonitorId == -1) {
+                let connector = currentMonitorMap[monitors.length + ""];
+                currentMonitorId = connector != null ? global.backend.get_monitor_manager().get_monitor_for_connector(connector) : Main.layoutManager.primaryIndex;
+                if (currentMonitorId == null || currentMonitorId < 0 || currentMonitorId >= monitors.length) {
                     currentMonitorId = 0;
                 }
             } catch {
                 currentMonitorId = 0;
             }
+            const currentSource = this.inputLanguageSettings.currentSource;
+            const currentLayoutId = currentSource?.xkbId ?? KeyboardManager.getKeyboardManager().currentLayout?.id ?? "us";
+            const keycodesPath = extract_dir + "/keycodes/" + currentLayoutId + '.json';
+            const fallbackKeycodesPath = extract_dir + "/keycodes/us.json";
             let postExtract = () => {
+                if (!this._extensionActive || refreshSerial !== this._refreshSerial)
+                    return;
+
                 if (this.Keyboard != null) {
                     this.Keyboard.destroy();
                     this.Keyboard = null;
                 }
-                let [ok, contents] = GLib.file_get_contents(extract_dir + "/keycodes/" + (KeyboardManager.getKeyboardManager().currentLayout != null ? KeyboardManager.getKeyboardManager().currentLayout.id : "us") + '.json');
-                if (ok) {
+                let contents = readFileContents(keycodesPath);
+                if (contents == null)
+                    contents = readFileContents(fallbackKeycodesPath);
+                if (contents != null) {
                     keycodes = JSON.parse(contents);
+                } else {
+                    logError(new Error(`Could not load keycodes for ${currentLayoutId} or fallback us`));
+                    return;
                 }
                 this.Keyboard = new Keyboard(this.settings, this);
                 this.Keyboard.refresh = refresh
+                if (this._restoreOpenAfterRefresh || this._pendingToggle) {
+                    this._restoreOpenAfterRefresh = false;
+                    this._pendingToggle = false;
+                    this._toggleKeyboard(true);
+                }
             }
-            if (!Gio.File.new_for_path(extract_dir).query_exists(null)) {
-                Gio.File.new_for_path(extract_dir).make_directory(null);
-                Gio.File.new_for_path(extract_dir + "/keycodes").make_directory(null);
+            if (!Gio.File.new_for_path(keycodesPath).query_exists(null) && !Gio.File.new_for_path(fallbackKeycodesPath).query_exists(null)) {
+                if (!Gio.File.new_for_path(extract_dir).query_exists(null))
+                    Gio.File.new_for_path(extract_dir).make_directory(null);
+                if (!Gio.File.new_for_path(extract_dir + "/keycodes").query_exists(null))
+                    Gio.File.new_for_path(extract_dir + "/keycodes").make_directory(null);
                 Gio.Subprocess.new(["tar", "-Jxf", this.path + "/keycodes.tar.xz", "-C", extract_dir + "/keycodes"], Gio.SubprocessFlags.NONE)
                     .wait_check_async(null)
                     .then(postExtract)
+                    .catch(err => logError(err, "Failed to extract GJS OSK keycodes"))
             } else {
                 postExtract();
             }
         }
         refresh()
 
-        this._originalLastDeviceIsTouchscreen = KeyboardUI.KeyboardManager.prototype._lastDeviceIsTouchscreen;
-        KeyboardUI.KeyboardManager.prototype._lastDeviceIsTouchscreen = () => { return false };
+        this._originalLastDeviceIsTouchscreen = KeyboardUI.KeyboardManager.prototype._lastDeviceIsTouchscreen ?? null;
+        if (this._originalLastDeviceIsTouchscreen !== null)
+            KeyboardUI.KeyboardManager.prototype._lastDeviceIsTouchscreen = () => { return false };
 
         this._indicator = null;
-        this.openInterval = null;
         if (this.settings.get_boolean("indicator-enabled")) {
-            this._indicator = new PanelMenu.Button(0.0, "GJS OSK Indicator", false);
-            let icon = new St.Icon({
-                gicon: new Gio.ThemedIcon({
-                    name: 'input-keyboard-symbolic'
-                }),
-                style_class: 'system-status-icon'
-            });
-            this._indicator.add_child(icon);
-
-            this._indicator.connect("button-press-event", () => this._toggleKeyboard());
-            this._indicator.connect("touch-event", (_actor, event) => {
-                if (event.type() == Clutter.EventType.TOUCH_END) this._toggleKeyboard()
-            });
+            this._indicator = this._createIndicator();
             Main.panel.addToStatusArea("GJS OSK Indicator", this._indicator);
         }
 
@@ -243,7 +325,9 @@ export default class GjsOskExtension extends Extension {
                 this.settings.scheme = "-dark"
             else
                 this.settings.scheme = ""
-            this.Keyboard.openedFromButton = false;
+            this._restoreOpenAfterRefresh = opened;
+            if (this.Keyboard != null)
+                this.Keyboard.openedFromButton = false;
             refresh()
             this._toggle._refresh();
             if (this.settings.get_boolean("indicator-enabled")) {
@@ -251,19 +335,7 @@ export default class GjsOskExtension extends Extension {
                     this._indicator.destroy();
                     this._indicator = null;
                 }
-                this._indicator = new PanelMenu.Button(0.0, "GJS OSK Indicator", false);
-                let icon = new St.Icon({
-                    gicon: new Gio.ThemedIcon({
-                        name: 'input-keyboard-symbolic'
-                    }),
-                    style_class: 'system-status-icon'
-                });
-                this._indicator.add_child(icon);
-
-                this._indicator.connect("button-press-event", () => this._toggleKeyboard());
-                this._indicator.connect("touch-event", (_actor, event) => {
-                    if (event.type() == Clutter.EventType.TOUCH_END) this._toggleKeyboard()
-                });
+                this._indicator = this._createIndicator();
                 Main.panel.addToStatusArea("GJS OSK Indicator", this._indicator);
             } else {
                 if (this._indicator != null) {
@@ -271,54 +343,83 @@ export default class GjsOskExtension extends Extension {
                     this._indicator = null;
                 }
             }
-            global.stage.disconnect(this.tapConnect)
+            if (this.tapConnect) {
+                global.stage.disconnect(this.tapConnect)
+                this.tapConnect = 0;
+            }
             if (this.openInterval !== null) {
                 clearInterval(this.openInterval);
                 this.openInterval = null;
             }
             this.open_interval();
-            if (opened) {
-                this._toggleKeyboard(true);
-            }
         }
         this.settingsHandlers = [
             this.settings.connect("changed", settingsChanged),
             this.darkSchemeSettings.connect("changed", (_, key) => { if (key == "color-scheme") settingsChanged() }),
-            this.inputLanguageSettings.connect("current-source-changed", settingsChanged)
+            this.inputLanguageSettings.connect("current-source-changed", () => {
+                if (this._inputSourceRefreshTimeout)
+                    GLib.source_remove(this._inputSourceRefreshTimeout);
+                this._inputSourceRefreshTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+                    this._inputSourceRefreshTimeout = 0;
+                    settingsChanged();
+                    return GLib.SOURCE_REMOVE;
+                });
+            })
         ];
     }
 
     disable() {
-        this.gnomeKeyboardSettings.disconnect(this.isGnomeKeyboardEnabledHandler)
-        this.gnomeKeyboardSettings.set_boolean('screen-keyboard-enabled', this.isGnomeKeyboardEnabled);
+        this._extensionActive = false;
+        this._refreshSerial = (this._refreshSerial ?? 0) + 1;
 
-        this._quick_settings_indicator.quickSettingsItems.forEach(item => item.destroy());
-        this._quick_settings_indicator.destroy();
-        this._quick_settings_indicator = null;
+        if (this.gnomeKeyboardSettings != null && this.isGnomeKeyboardEnabledHandler != null) {
+            this.gnomeKeyboardSettings.disconnect(this.isGnomeKeyboardEnabledHandler)
+            this.gnomeKeyboardSettings.set_boolean('screen-keyboard-enabled', this.isGnomeKeyboardEnabled);
+        }
+
+        if (this._quick_settings_indicator != null) {
+            this._quick_settings_indicator.quickSettingsItems.forEach(item => item.destroy());
+            this._quick_settings_indicator.destroy();
+            this._quick_settings_indicator = null;
+        }
 
         if (this._indicator !== null) {
             this._indicator.destroy();
             this._indicator = null;
         }
-        if (this.Keyboard != null)
+        if (this.Keyboard != null) {
             this.Keyboard.destroy();
-        this.settings.disconnect(this.settingsHandlers[0]);
-        this.darkSchemeSettings.disconnect(this.settingsHandlers[1])
-        this.inputLanguageSettings.disconnect(this.settingsHandlers[2])
-        this.settings = null;
-        this.darkSchemeSettings = null;
-        this.inputLanguageSettings = null;
-        this.gnomeKeyboardSettings = null;
-        this.openBit.disconnect(this.openFromCommandHandler);
+            this.Keyboard = null;
+        }
+        if (this.settingsHandlers != null) {
+            this.settings.disconnect(this.settingsHandlers[0]);
+            this.darkSchemeSettings.disconnect(this.settingsHandlers[1])
+            this.inputLanguageSettings.disconnect(this.settingsHandlers[2])
+            this.settingsHandlers = null;
+        }
+        if (this.openBit != null && this.openFromCommandHandler != null)
+            this.openBit.disconnect(this.openFromCommandHandler);
         this.openBit = null;
-        global.stage.disconnect(this.tapConnect)
+        if (this.tapConnect) {
+            global.stage.disconnect(this.tapConnect)
+            this.tapConnect = 0;
+        }
         if (this.openInterval !== null) {
             clearInterval(this.openInterval);
             this.openInterval = null;
         }
-        this._toggle.destroy()
-        this._toggle = null
+        if (this._inputSourceRefreshTimeout) {
+            GLib.source_remove(this._inputSourceRefreshTimeout);
+            this._inputSourceRefreshTimeout = 0;
+        }
+        if (this._toggle != null) {
+            this._toggle.destroy()
+            this._toggle = null
+        }
         this.settings = null
+        this.darkSchemeSettings = null;
+        this.inputLanguageSettings = null;
+        this.gnomeKeyboardSettings = null;
         this.Keyboard = null
         keycodes = null
         if (this._originalLastDeviceIsTouchscreen !== null) {
@@ -344,8 +445,11 @@ class Keyboard extends Dialog {
         this.settingsOpenFunction = extensionObject.openPrefs
         this.inputDevice = Clutter.get_default_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         this.settings = settings;
-        let monitor = Main.layoutManager.monitors[currentMonitorId];
+        let monitor = getCurrentMonitor();
         super._init(Main.layoutManager.modalDialogGroup, 'db-keyboard-content');
+        this.keymap = Clutter.get_default_backend().get_default_seat().get_keymap()
+        this.capslockConnect = 0;
+        this.numLockConnect = 0;
         this.box = new St.Widget({
             reactive: true,
             layout_manager: new Clutter.GridLayout({
@@ -397,8 +501,14 @@ class Keyboard extends Dialog {
             global.stage.remove_action(this.oldBottomDragAction);
         if (side != null) {
             const mode = Shell.ActionMode.ALL & ~Shell.ActionMode.LOCK_SCREEN;
-            const bottomDragAction = new EdgeDragAction.EdgeDragAction(side, mode);
-            bottomDragAction.connect('activated', () => {
+            const bottomDragAction = new Shell.EdgeDragGesture({
+                name: 'osk',
+                side,
+            });
+            bottomDragAction.connect('may-recognize', () => {
+                return mode & Main.actionMode;
+            });
+            bottomDragAction.connect('end', () => {
                 this.open(true);
                 this.openedFromButton = true;
                 this.closedFromButton = false;
@@ -410,7 +520,7 @@ class Keyboard extends Dialog {
                 this.setOpenState(Math.min(Math.max(0, (progress / (side % 2 == 0 ? this.box.height : this.box.width)) * 100), 100))
                 this.gestureInProgress = true;
             });
-            bottomDragAction.connect('gesture-cancel', () => {
+            bottomDragAction.connect('cancel', () => {
                 if (this.gestureInProgress) {
                     this.close()
                     this.openedFromButton = false;
@@ -419,13 +529,13 @@ class Keyboard extends Dialog {
                 this.gestureInProgress = false;
                 return Clutter.EVENT_PROPAGATE;
             });
-            global.stage.add_action_full('osk', Clutter.EventPhase.CAPTURE, bottomDragAction);
+            global.stage.add_action(bottomDragAction);
             this.bottomDragAction = bottomDragAction;
         } else {
             this.bottomDragAction = null;
         }
         this._oldMaybeHandleEvent = Main.keyboard.maybeHandleEvent
-        Main.keyboard.maybeHandleEvent = (e) => {
+        this._maybeHandleEvent = (e) => {
             let lastInputMethod = [e.type() == 11, e.type() == 11, e.type() == 7 || e.type() == 11][this.settings.get_int("enable-tap-gesture")]
             let ac = global.stage.get_event_actor(e)
             if (this.contains(ac)) {
@@ -437,11 +547,14 @@ class Keyboard extends Dialog {
             }
             return false
         }
+        Main.keyboard.maybeHandleEvent = this._maybeHandleEvent
     }
 
     destroy() {
-        Main.keyboard.maybeHandleEvent = this._oldMaybeHandleEvent
-        global.stage.remove_action_by_name('osk')
+        if (Main.keyboard.maybeHandleEvent === this._maybeHandleEvent)
+            Main.keyboard.maybeHandleEvent = this._oldMaybeHandleEvent
+        if (this.bottomDragAction != null && global.stage.get_action('osk') === this.bottomDragAction)
+            global.stage.remove_action(this.bottomDragAction)
         if (this.oldBottomDragAction !== null && this.oldBottomDragAction instanceof Clutter.Action)
             global.stage.add_action_full('osk', Clutter.EventPhase.CAPTURE, this.oldBottomDragAction)
         if (this.textboxChecker !== null) {
@@ -456,8 +569,10 @@ class Keyboard extends Dialog {
             clearTimeout(this.keyTimeout);
             this.keyTimeout = null;
         }
-        this.keymap.disconnect(this.capslockConnect);
-        this.keymap.disconnect(this.numLockConnect);
+        if (this.keymap != null && this.capslockConnect)
+            this.keymap.disconnect(this.capslockConnect);
+        if (this.keymap != null && this.numLockConnect)
+            this.keymap.disconnect(this.numLockConnect);
         global.backend.get_monitor_manager().disconnect(this.monitorChecker)
         super.destroy();
         if (this.nonDragBlocker !== null) {
@@ -477,10 +592,8 @@ class Keyboard extends Dialog {
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onComplete: () => { }
             });
-            let device = event.get_device();
-            let sequence = event.get_event_sequence();
+            let sequence = event.get_event_sequence?.() ?? null;
             this._grab = global.stage.grab(this);
-            this._grabbedDevice = device;
             this._grabbedSequence = sequence;
             this.emit('drag-begin');
             let [absX, absY] = event.get_coords();
@@ -492,36 +605,30 @@ class Keyboard extends Dialog {
     }
 
     endDragging() {
-        if (this.draggable) {
-            if (this._dragging) {
-                if (this._releaseId) {
-                    this.disconnect(this._releaseId);
-                    this._releaseId = 0;
-                }
-                if (this._grab) {
-                    this._grab.dismiss();
-                    this._grab = null;
-                }
-
-                this.box.set_opacity(200);
-                this.box.ease({
-                    opacity: 255,
-                    duration: 100,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                    onComplete: () => { }
-                });
-                this._grabbedSequence = null;
-                this._grabbedDevice = null;
-                this._dragging = false;
-                this.delta = [];
-                this.emit('drag-end');
-                this._dragging = false;
+        if (this._dragging) {
+            if (this._releaseId) {
+                this.disconnect(this._releaseId);
+                this._releaseId = 0;
             }
-            this.draggable = false;
-            return Clutter.EVENT_STOP;
-        } else {
-            return Clutter.EVENT_STOP;
+            if (this._grab) {
+                this._grab.dismiss();
+                this._grab = null;
+            }
+
+            this.box.set_opacity(200);
+            this.box.ease({
+                opacity: 255,
+                duration: 100,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => { }
+            });
+            this._grabbedSequence = null;
+            this._dragging = false;
+            this.delta = [];
+            this.emit('drag-end');
         }
+        this.draggable = false;
+        return Clutter.EVENT_STOP;
     }
 
     motionEvent(event) {
@@ -534,8 +641,25 @@ class Keyboard extends Dialog {
         }
     }
 
+    connectMoveHandle(moveHandle) {
+        moveHandle.connect("event", (_actor, event) => {
+            if (event.type() == Clutter.EventType.BUTTON_PRESS || event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                this.draggable = this.settings.get_boolean("enable-drag");
+                let [eventX, eventY] = event.get_coords();
+                this.delta = [eventX - this.translation_x, eventY - this.translation_y];
+                return this.startDragging(event, this.delta);
+            } else if (event.type() == Clutter.EventType.TOUCH_UPDATE && this._dragging) {
+                return this.motionEvent(event);
+            } else if ((event.type() == Clutter.EventType.TOUCH_END || event.type() == Clutter.EventType.TOUCH_CANCEL) && this._dragging) {
+                return this.endDragging();
+            }
+
+            return Clutter.EVENT_PROPAGATE;
+        })
+    }
+
     snapMovement(xPos, yPos) {
-        let monitor = Main.layoutManager.monitors[currentMonitorId]
+        let monitor = getCurrentMonitor()
         if (xPos < monitor.x || yPos < monitor.y || xPos > monitor.x + monitor.width || yPos > monitor.y + monitor.width) {
             this.set_translation(xPos, yPos, 0);
             return;
@@ -561,7 +685,7 @@ class Keyboard extends Dialog {
     }
 
     setOpenState(percent) {
-        let monitor = Main.layoutManager.monitors[currentMonitorId];
+        let monitor = getCurrentMonitor();
         let posX = [this.settings.get_int("snap-spacing-px"), ((monitor.width * .5) - ((this.width * .5))), monitor.width - this.width - this.settings.get_int("snap-spacing-px")][(this.settings.get_int("default-snap") % 3)];
         let posY = [this.settings.get_int("snap-spacing-px"), ((monitor.height * .5) - ((this.height * .5))), monitor.height - this.height - this.settings.get_int("snap-spacing-px")][Math.floor((this.settings.get_int("default-snap") / 3))];
         let mX = [-this.box.width, 0, this.box.width][(this.settings.get_int("default-snap") % 3)];
@@ -582,7 +706,7 @@ class Keyboard extends Dialog {
             this.show();
         }
         if (noPrep == null || noPrep) {
-            let monitor = Main.layoutManager.monitors[currentMonitorId];
+            let monitor = getCurrentMonitor();
             let posX = [this.settings.get_int("snap-spacing-px"), ((monitor.width * .5) - ((this.width * .5))), monitor.width - this.width - this.settings.get_int("snap-spacing-px")][(this.settings.get_int("default-snap") % 3)];
             let posY = [this.settings.get_int("snap-spacing-px"), ((monitor.height * .5) - ((this.height * .5))), monitor.height - this.height - this.settings.get_int("snap-spacing-px")][Math.floor((this.settings.get_int("default-snap") / 3))];
             if (noPrep == null) {
@@ -623,7 +747,7 @@ class Keyboard extends Dialog {
 
     close(instant = null) {
         this.prevKeyFocus = null;
-        let monitor = Main.layoutManager.monitors[currentMonitorId];
+        let monitor = getCurrentMonitor();
         let posX = [this.settings.get_int("snap-spacing-px"), ((monitor.width * .5) - ((this.width * .5))), monitor.width - this.width - this.settings.get_int("snap-spacing-px")][(this.settings.get_int("default-snap") % 3)];
         let posY = [this.settings.get_int("snap-spacing-px"), ((monitor.height * .5) - ((this.height * .5))), monitor.height - this.height - this.settings.get_int("snap-spacing-px")][Math.floor((this.settings.get_int("default-snap") / 3))];
         let mX = [-this.box.width, 0, this.box.width][(this.settings.get_int("default-snap") % 3)];
@@ -662,9 +786,10 @@ class Keyboard extends Dialog {
         // [insert handwrting 6]
     }
 
-    vfunc_button_press_event() {
-        this.delta = [Clutter.get_current_event().get_coords()[0] - this.translation_x, Clutter.get_current_event().get_coords()[1] - this.translation_y];
-        return this.startDragging(Clutter.get_current_event(), this.delta)
+    vfunc_button_press_event(event) {
+        let [eventX, eventY] = event.get_coords();
+        this.delta = [eventX - this.translation_x, eventY - this.translation_y];
+        return this.startDragging(event, this.delta)
     }
 
     vfunc_button_release_event() {
@@ -674,28 +799,28 @@ class Keyboard extends Dialog {
         return Clutter.EVENT_PROPAGATE;
     }
 
-    vfunc_motion_event() {
-        let event = Clutter.get_current_event();
+    vfunc_motion_event(event) {
         if (this._dragging && !this._grabbedSequence) {
+            if ((event.get_state() & Clutter.ModifierType.BUTTON1_MASK) === 0)
+                return this.endDragging();
             this.motionEvent(event);
         }
         return Clutter.EVENT_PROPAGATE;
     }
 
-    vfunc_touch_event() {
-        let event = Clutter.get_current_event();
-        let sequence = event.get_event_sequence();
+    vfunc_touch_event(event) {
+        let sequence = event.get_event_sequence?.() ?? null;
 
         if (!this._dragging && event.type() == Clutter.EventType.TOUCH_BEGIN) {
             this.delta = [event.get_coords()[0] - this.translation_x, event.get_coords()[1] - this.translation_y];
             this.startDragging(event, this.delta);
             return Clutter.EVENT_STOP;
-        } else if (this._grabbedSequence && sequence.get_slot() === this._grabbedSequence.get_slot()) {
-            if (event.type() == Clutter.EventType.TOUCH_UPDATE) {
-                return this.motionEvent(event);
-            } else if (event.type() == Clutter.EventType.TOUCH_END) {
-                return this.endDragging();
-            }
+        } else if (this._grabbedSequence && sequence != null && sequence.get_slot() === this._grabbedSequence.get_slot()) {
+                if (event.type() == Clutter.EventType.TOUCH_UPDATE) {
+                    return this.motionEvent(event);
+                } else if (event.type() == Clutter.EventType.TOUCH_END || event.type() == Clutter.EventType.TOUCH_CANCEL) {
+                    return this.endDragging();
+                }
         }
 
         return Clutter.EVENT_PROPAGATE;
@@ -704,8 +829,10 @@ class Keyboard extends Dialog {
     buildUI() {
         this.box.set_opacity(0);
         this.keys = [];
-        let monitor = Main.layoutManager.monitors[currentMonitorId]
-        let layoutName = Object.keys(layouts)[(monitor.width > monitor.height) ? this.settings.get_int("layout-landscape") : this.settings.get_int("layout-portrait")];
+        let monitor = getCurrentMonitor()
+        let layoutNames = Object.keys(layouts);
+        let layoutIndex = clampIndex((monitor.width > monitor.height) ? this.settings.get_int("layout-landscape") : this.settings.get_int("layout-portrait"), layoutNames.length);
+        let layoutName = layoutNames[layoutIndex];
         this.box.width = Math.round((monitor.width - this.settings.get_int("snap-spacing-px") * 2) * (layoutName.includes("Split") ? 1 : this.widthPercent))
         this.box.height = Math.round((monitor.height - this.settings.get_int("snap-spacing-px") * 2) * this.heightPercent)
 
@@ -839,13 +966,11 @@ class Keyboard extends Dialog {
                 keyBtn.add_style_class_name('key')
                 keyBtn.char = i
                 if (i.code == 58) {
-                    this.keymap = Clutter.get_default_backend().get_default_seat().get_keymap()
                     this.capslockConnect = this.keymap.connect("state-changed", (a, e) => {
                         this.setCapsLock(keyBtn, this.keymap.get_caps_lock_state())
                     })
                     this.updateCapsLock = () => this.setCapsLock(keyBtn, this.keymap.get_caps_lock_state())
                 } else if (i.code == 69) {
-                    this.keymap = Clutter.get_default_backend().get_default_seat().get_keymap()
                     this.numLockConnect = this.keymap.connect("state-changed", (a, e) => {
                         this.setNumLock(keyBtn, this.keymap.get_num_lock_state())
                     })
@@ -919,6 +1044,13 @@ class Keyboard extends Dialog {
             settingsBtn.connect("clicked", () => {
                 this.settingsOpenFunction();
             })
+            settingsBtn.connect("touch-event", (_actor, event) => {
+                if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    this.settingsOpenFunction();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            })
             gridLeft.attach(settingsBtn, 0, 0, 2 * topBtnWidth, 3)
             this.keys.push(settingsBtn)
 
@@ -929,8 +1061,16 @@ class Keyboard extends Dialog {
             closeBtn.add_style_class_name("close_btn")
             closeBtn.add_style_class_name("key")
             closeBtn.connect("clicked", () => {
-                this.close();
                 this.closedFromButton = true;
+                this.close();
+            })
+            closeBtn.connect("touch-event", (_actor, event) => {
+                if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    this.closedFromButton = true;
+                    this.close();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
             })
             gridRight.attach(closeBtn, (rowSize - 2 * topBtnWidth), 0, 2 * topBtnWidth, 3)
             this.keys.push(closeBtn)
@@ -947,12 +1087,7 @@ class Keyboard extends Dialog {
                 moveHandleLeft.add_style_class_name("regular");
             }
 
-            moveHandleLeft.connect("event", (actor, event) => {
-                if (event.type() == Clutter.EventType.BUTTON_PRESS || event.type() == Clutter.EventType.TOUCH_BEGIN) {
-                    this.draggable = this.settings.get_boolean("enable-drag");
-                }
-                this.event(event, false)
-            })
+            this.connectMoveHandle(moveHandleLeft)
             gridLeft.attach(moveHandleLeft, 2 * topBtnWidth, 0, (halfSize - 2 * topBtnWidth), 3)
 
             let moveHandleRight = new St.Button({
@@ -967,12 +1102,7 @@ class Keyboard extends Dialog {
                 moveHandleRight.add_style_class_name("regular");
             }
 
-            moveHandleRight.connect("event", (actor, event) => {
-                if (event.type() == Clutter.EventType.BUTTON_PRESS || event.type() == Clutter.EventType.TOUCH_BEGIN) {
-                    this.draggable = this.settings.get_boolean("enable-drag");
-                }
-                this.event(event, false)
-            })
+            this.connectMoveHandle(moveHandleRight)
             gridRight.attach(moveHandleRight, halfSize, 0, (rowSize - halfSize - 2 * topBtnWidth), 3)
             gridLeft.attach(new St.Widget({ x_expand: true, y_expand: true }), 0, 3, halfSize, 1)
             gridRight.attach(new St.Widget({ x_expand: true, y_expand: true }), halfSize, 3, (rowSize - halfSize), 1)
@@ -1002,6 +1132,13 @@ class Keyboard extends Dialog {
             settingsBtn.connect("clicked", () => {
                 this.settingsOpenFunction();
             })
+            settingsBtn.connect("touch-event", (_actor, event) => {
+                if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    this.settingsOpenFunction();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            })
             grid.attach(settingsBtn, 0, 0, 2 * topBtnWidth, 3)
             this.keys.push(settingsBtn)
 
@@ -1012,8 +1149,16 @@ class Keyboard extends Dialog {
             closeBtn.add_style_class_name("close_btn")
             closeBtn.add_style_class_name("key")
             closeBtn.connect("clicked", () => {
-                this.close();
                 this.closedFromButton = true;
+                this.close();
+            })
+            closeBtn.connect("touch-event", (_actor, event) => {
+                if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    this.closedFromButton = true;
+                    this.close();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
             })
             grid.attach(closeBtn, (rowSize - 2 * topBtnWidth), 0, 2 * topBtnWidth, 3)
             this.keys.push(closeBtn)
@@ -1032,12 +1177,7 @@ class Keyboard extends Dialog {
                 moveHandle.add_style_class_name("regular");
             }
 
-            moveHandle.connect("event", (actor, event) => {
-                if (event.type() == Clutter.EventType.BUTTON_PRESS || event.type() == Clutter.EventType.TOUCH_BEGIN) {
-                    this.draggable = this.settings.get_boolean("enable-drag");
-                }
-                this.event(event, false)
-            })
+            this.connectMoveHandle(moveHandle)
             grid.attach(moveHandle, 2 * topBtnWidth, 0, (rowSize - 4 * topBtnWidth), 3) // [insert handwriting 11]
             grid.attach(new St.Widget({ x_expand: true, y_expand: true }), 0, 3, rowSize, 1)
         }
@@ -1068,9 +1208,23 @@ class Keyboard extends Dialog {
                     item.tap_repeat == null
                 }
             })
-            let pressEv = (evType) => {
+            if (item.char === undefined)
+                return;
+
+            item.button_pressed = null;
+            item.button_repeat = null;
+            item.tap_pressed = null;
+            item.tap_repeat = null;
+            item.space_motion_handler = null;
+            item.space_touch_handler = null;
+            item.key_pressed = false;
+            item._touchPressed = false;
+            item._ignoreNextGestureRelease = false;
+
+            let pressEv = () => {
                 this.box.set_child_at_index(item, this.box.get_children().length - 1);
                 item.space_motion_handler = null
+                item.space_touch_handler = null
                 item.set_scale(1.2, 1.2)
                 item.add_style_pseudo_class("pressed")
                 let player
@@ -1095,33 +1249,23 @@ class Keyboard extends Dialog {
                 } else if (item.has_style_class_name("space_btn")) {
                     item.button_pressed = setTimeout(() => {
                         let lastPos = (item.get_transformed_position()[0] + item.get_transformed_size()[0] / 2)
-                        if (evType == "mouse") {
-                            item.space_motion_handler = item.connect("motion_event", (actor, event) => {
-                                let absX = event.get_coords()[0];
-                                if (Math.abs(absX - lastPos) > 20) {
-                                    if (absX > lastPos) {
-                                        this.sendKey([106])
-                                    } else {
-                                        this.sendKey([105])
-                                    }
-                                    lastPos = absX
+                        let handleSpaceMotion = absX => {
+                            if (Math.abs(absX - lastPos) > 20) {
+                                if (absX > lastPos) {
+                                    this.sendKey([106])
+                                } else {
+                                    this.sendKey([105])
                                 }
-                            })
-                        } else {
-                            item.space_motion_handler = item.connect("touch_event", (actor, event) => {
-                                if (event.type() == Clutter.EventType.TOUCH_UPDATE) {
-                                    let absX = event.get_coords()[0];
-                                    if (Math.abs(absX - lastPos) > 20) {
-                                        if (absX > lastPos) {
-                                            this.sendKey([106])
-                                        } else {
-                                            this.sendKey([105])
-                                        }
-                                        lastPos = absX
-                                    }
-                                }
-                            })
+                                lastPos = absX
+                            }
                         }
+                        item.space_motion_handler = item.connect("motion_event", (actor, event) => {
+                            handleSpaceMotion(event.get_coords()[0]);
+                        })
+                        item.space_touch_handler = item.connect("touch_event", (actor, event) => {
+                            if (event.type() == Clutter.EventType.TOUCH_UPDATE)
+                                handleSpaceMotion(event.get_coords()[0]);
+                        })
                     }, 750)
                 } else {
                     item.key_pressed = true;
@@ -1147,10 +1291,16 @@ class Keyboard extends Dialog {
                     clearInterval(item.button_repeat)
                     item.button_repeat == null
                 }
+                let hadSpaceMotion = item.space_motion_handler !== null || item.space_touch_handler !== null;
                 if (item.space_motion_handler !== null) {
                     item.disconnect(item.space_motion_handler)
                     item.space_motion_handler = null;
-                } else if (item.key_pressed == true || item.space_motion_handler == null) {
+                }
+                if (item.space_touch_handler !== null) {
+                    item.disconnect(item.space_touch_handler)
+                    item.space_touch_handler = null;
+                }
+                if (!hadSpaceMotion && (item.key_pressed == true || item.space_motion_handler == null)) {
                     try {
                         if (!item.char.isMod) {
                             this.decideMod(item.char)
@@ -1162,14 +1312,36 @@ class Keyboard extends Dialog {
                 }
                 item.key_pressed = false;
             }
-            item.connect("button-press-event", () => pressEv("mouse"))
-            item.connect("button-release-event", releaseEv)
-            item.connect("touch-event", () => {
-                if (Clutter.get_current_event().type() == Clutter.EventType.TOUCH_BEGIN) {
-                    pressEv("touch")
-                } else if (Clutter.get_current_event().type() == Clutter.EventType.TOUCH_END || Clutter.get_current_event().type() == Clutter.EventType.TOUCH_CANCEL) {
+
+            const pressGesture = new Clutter.ClickGesture();
+            pressGesture.set_recognize_on_press(true);
+            pressGesture.set_cancel_threshold(-1);
+            pressGesture.connect('notify::pressed', () => {
+                if (item._touchPressed)
+                    return;
+                if (item._ignoreNextGestureRelease && !pressGesture.get_pressed()) {
+                    item._ignoreNextGestureRelease = false;
+                    return;
+                }
+                if (pressGesture.get_pressed()) {
+                    pressEv()
+                } else {
                     releaseEv()
                 }
+            })
+            item.add_action(pressGesture);
+            item.connect("touch-event", (_actor, event) => {
+                if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    item._touchPressed = true;
+                    pressEv();
+                    return Clutter.EVENT_STOP;
+                } else if ((event.type() == Clutter.EventType.TOUCH_END || event.type() == Clutter.EventType.TOUCH_CANCEL) && item._touchPressed) {
+                    item._touchPressed = false;
+                    item._ignoreNextGestureRelease = true;
+                    releaseEv();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
             })
         });
     }
@@ -1212,6 +1384,9 @@ class Keyboard extends Dialog {
         })
 
         this.keys.forEach(item => {
+            if (item.char === undefined)
+                return;
+
             item.key_pressed = false;
             if (item.button_pressed !== null) {
                 clearTimeout(item.button_pressed)
@@ -1224,6 +1399,10 @@ class Keyboard extends Dialog {
             if (item.space_motion_handler !== null) {
                 item.disconnect(item.space_motion_handler)
                 item.space_motion_handler = null;
+            }
+            if (item.space_touch_handler !== null) {
+                item.disconnect(item.space_touch_handler)
+                item.space_touch_handler = null;
             }
         })
     }
@@ -1324,10 +1503,14 @@ class Keyboard extends Dialog {
 
     setNormMod(button) {
         if (this.mod.includes(button.char.code)) {
-            this.mod.splice(this.mod.indexOf(button.char.code), this.mod.indexOf(button.char.code) + 1);
+            const modIndex = this.mod.indexOf(button.char.code);
+            if (modIndex >= 0)
+                this.mod.splice(modIndex, 1);
             if (!(button.char.code == 42) && !(button.char.code == 54))
                 button.remove_style_class_name("selected");
-            this.modBtns.splice(this.modBtns.indexOf(button), this.modBtns.indexOf(button) + 1);
+            const buttonIndex = this.modBtns.indexOf(button);
+            if (buttonIndex >= 0)
+                this.modBtns.splice(buttonIndex, 1);
             this.inputDevice.notify_key(Clutter.get_current_event_time(), button.char.code, Clutter.KeyState.RELEASED);
             this.sendKey([button.char.code])
         } else {
