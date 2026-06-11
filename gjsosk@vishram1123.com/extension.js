@@ -14,7 +14,7 @@ import * as KeyboardManager from 'resource:///org/gnome/shell/misc/keyboardManag
 import * as KeyboardUI from 'resource:///org/gnome/shell/ui/keyboard.js';
 import * as InputSourceManager from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 import * as Config from 'resource:///org/gnome/shell/misc/config.js'
-const [major, minor] = Config.PACKAGE_VERSION.split('.').map(s => Number(s));
+const [major] = Config.PACKAGE_VERSION.split('.').map(s => Number(s));
 import { Dialog } from 'resource:///org/gnome/shell/ui/dialog.js';
 
 import { Extension, gettext as _ } from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -236,19 +236,13 @@ function getCurrentMonitor() {
 
 export default class GjsOskExtension extends Extension {
     _openKeyboard(instant) {
-        if (this.Keyboard != null && this.Keyboard.state !== State.OPENED && this.Keyboard.state !== State.OPENING) {
+        if (this.Keyboard != null && this.Keyboard.state !== State.OPENED && this.Keyboard.state !== State.OPENING)
             this.Keyboard.open({ instant: !!instant });
-            if (this.openBit != null && !this.openBit.get_boolean('keyboard-visible'))
-                this.openBit.set_boolean('keyboard-visible', true);
-        }
     }
 
     _closeKeyboard(instant) {
-        if (this.Keyboard != null && this.Keyboard.state !== State.CLOSED && this.Keyboard.state !== State.CLOSING) {
+        if (this.Keyboard != null && this.Keyboard.state !== State.CLOSED && this.Keyboard.state !== State.CLOSING)
             this.Keyboard.close({ instant: !!instant });
-            if (this.openBit != null && this.openBit.get_boolean('keyboard-visible'))
-                this.openBit.set_boolean('keyboard-visible', false);
-        }
     }
 
     _toggleKeyboard(instant = false) {
@@ -377,10 +371,6 @@ export default class GjsOskExtension extends Extension {
             logError(new Error("Could not load physicalLayouts.json"));
             return;
         }
-
-        this.customLayouts = normalizeCustomLayouts(this.settings.get_string("custom-layout") || "[]");
-        if (this.settings.get_string("custom-layout") !== JSON.stringify(this.customLayouts))
-            this.settings.set_string("custom-layout", JSON.stringify(this.customLayouts));
 
         let refresh = () => {
             if (!this._extensionActive)
@@ -630,7 +620,6 @@ class Keyboard extends Dialog {
         this.stateTimeout = null;
         this.keyTimeout = null;
         this.keyTimeoutFunc = null;
-        this.keyInProgress = false;
         this.opened = false;
         this.state = State.CLOSED;
         this.delta = [];
@@ -783,10 +772,6 @@ class Keyboard extends Dialog {
 
     endDragging() {
         if (this._dragging) {
-            if (this._releaseId) {
-                this.disconnect(this._releaseId);
-                this._releaseId = 0;
-            }
             if (this._grab) {
                 this._grab.dismiss();
                 this._grab = null;
@@ -809,13 +794,9 @@ class Keyboard extends Dialog {
     }
 
     motionEvent(event) {
-        if (this.draggable) {
-            let [absX, absY] = event.get_coords();
-            this.snapMovement(absX - this.delta[0], absY - this.delta[1]);
-            return Clutter.EVENT_STOP
-        } else {
-            return Clutter.EVENT_STOP
-        }
+        let [absX, absY] = event.get_coords();
+        this.snapMovement(absX - this.delta[0], absY - this.delta[1]);
+        return Clutter.EVENT_STOP;
     }
 
     connectMoveHandle(moveHandle) {
@@ -1209,10 +1190,7 @@ class Keyboard extends Dialog {
                 } else {
                     params.label = i.layers.default
                 }
-                i.isMod = false
-                if (MODIFIER_KEY_CODES.has(i.code)) {
-                    i.isMod = true;
-                }
+                i.isMod = MODIFIER_KEY_CODES.has(i.code);
                 const keyBtn = new St.Button(params)
                 keyBtn.add_style_class_name('key')
                 keyBtn.char = i
@@ -1237,8 +1215,7 @@ class Keyboard extends Dialog {
                 c += (("width" in keydef) ? keydef.width : 1) * 2
             } else if (i == "split") {
                 currentGrid = gridRight
-                const size = c
-                if (!halfSize) halfSize = size
+                if (!halfSize) halfSize = c
             }
         }
 
@@ -1257,8 +1234,7 @@ class Keyboard extends Dialog {
                 }
             }
             if (!topBtnWidth) topBtnWidth = ((("width" in kRow[kRow.length - 1]) && ("key" in kRow[kRow.length - 1])) ? kRow[kRow.length - 1].width : 1)
-            const size = c;
-            if (!rowSize) rowSize = size;
+            if (!rowSize) rowSize = c;
             r += r == 0 ? 3 : 4
         }
 
@@ -1455,8 +1431,6 @@ class Keyboard extends Dialog {
             item.set_pivot_point(0.5, 0.5)
             item.button_pressed = null;
             item.button_repeat = null;
-            item.tap_pressed = null;
-            item.tap_repeat = null;
             item.space_motion_handler = null;
             item.space_touch_handler = null;
             item.key_pressed = false;
@@ -1469,14 +1443,6 @@ class Keyboard extends Dialog {
                 if (item.button_repeat !== null) {
                     clearInterval(item.button_repeat)
                     item.button_repeat = null
-                }
-                if (item.tap_pressed !== null) {
-                    clearTimeout(item.tap_pressed)
-                    item.tap_pressed = null
-                }
-                if (item.tap_repeat !== null) {
-                    clearInterval(item.tap_repeat)
-                    item.tap_repeat = null
                 }
             })
             if (item.char === undefined)
@@ -1715,7 +1681,6 @@ class Keyboard extends Dialog {
         try {
             this.finishKeyPress();
 
-            this.keyInProgress = true;
             const eventTime = this.getEventTime();
             for (let i = 0; i < keys.length; i++) {
                 this.inputDevice.notify_key(eventTime, keys[i], Clutter.KeyState.PRESSED);
@@ -1725,13 +1690,11 @@ class Keyboard extends Dialog {
                 for (let j = keys.length - 1; j >= 0; j--) {
                     this.inputDevice.notify_key(eventTime, keys[j], Clutter.KeyState.RELEASED);
                 }
-                this.keyInProgress = false;
             };
             this.keyTimeout = setTimeout(() => {
                 this.finishKeyPress();
             }, 5);
         } catch (err) {
-            this.keyInProgress = false;
             throw new Error("GJS-OSK: An unknown error occured. Please report this bug to the Issues page (https://github.com/Vishram1123/gjs-osk/issues):\n\n" + err + "\n\nKeys Pressed: " + keys);
         }
     }
