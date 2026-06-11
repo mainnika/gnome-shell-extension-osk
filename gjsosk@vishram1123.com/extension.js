@@ -43,6 +43,8 @@ const KeyCode = {
     DELETE: 111,
     LEFT_SUPER: 125,
     RIGHT_SUPER: 126,
+    PRSC: 99,
+    FN: 464,
 };
 
 const MODIFIER_KEY_CODES = new Set([
@@ -94,9 +96,8 @@ class KeyboardMenuToggle extends QuickSettings.QuickMenuToggle {
         });
 
         this.menu.addMenuItem(this._itemsSection);
-        this.settings.bind('indicator-enabled',
-            this, 'checked',
-            Gio.SettingsBindFlags.DEFAULT);
+        // Avoid binding to GSettings after object may be destroyed during reload.
+        this.checked = this.settings.get_boolean('indicator-enabled');
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const settingsItem = this.menu.addAction(_('More Settings'),
             () => this.extensionObject.openPreferences());
@@ -494,7 +495,9 @@ export default class GjsOskExtension extends Extension {
             if (this.Keyboard != null)
                 this.Keyboard.openedFromButton = false;
             refresh()
-            this._toggle._refresh();
+            this._toggle?._refresh?.();
+            if (this._toggle)
+                this._toggle.checked = this.settings.get_boolean('indicator-enabled');
             if (this.settings.get_boolean("indicator-enabled")) {
                 if (this._indicator != null) {
                     this._indicator.destroy();
@@ -535,8 +538,12 @@ export default class GjsOskExtension extends Extension {
         }
 
         if (this._quick_settings_indicator != null) {
-            this._quick_settings_indicator.quickSettingsItems.forEach(item => item.destroy());
-            this._quick_settings_indicator.destroy();
+            try {
+                this._quick_settings_indicator.quickSettingsItems.forEach(item => {
+                    try { item.destroy(); } catch (e) { /* ignore */ }
+                });
+            } catch (e) { /* ignore */ }
+            try { this._quick_settings_indicator.destroy(); } catch (e) { /* ignore */ }
             this._quick_settings_indicator = null;
         }
 
@@ -576,7 +583,7 @@ export default class GjsOskExtension extends Extension {
             this._inputSourceRefreshTimeout = 0;
         }
         if (this._toggle != null) {
-            this._toggle.destroy()
+            try { this._toggle.destroy(); } catch (e) { /* ignore */ }
             this._toggle = null
         }
         this.settings = null
@@ -617,6 +624,8 @@ class Keyboard extends Dialog {
         this.capsL = false;
         this.shift = false;
         this.alt = false;
+        this.fn = false;       // FN layer toggle (media keys ↔ F1-F12)
+        this.fnButton = null;  // reference to FN button for visual state
         this.stateTimeout = null;
         this.keyTimeout = null;
         this.keyTimeoutFunc = null;
@@ -1161,6 +1170,23 @@ class Keyboard extends Dialog {
         let r = 0;
         let c;
         const doAddKey = (keydef) => {
+            // Handle special FN toggle key (not in keycodes database)
+            if ("key" in keydef && keydef.key === "FN") {
+                const fnKey = {
+                    code: KeyCode.FN,
+                    keyName: "FN",
+                    layers: { default: "Fn", shift: "Fn", alt: "Fn", caps: "Fn", num: "Fn" },
+                    isMod: true,
+                };
+                const keyBtn = new St.Button({ x_expand: true, y_expand: true, label: "Fn" });
+                keyBtn.add_style_class_name('key');
+                keyBtn.char = fnKey;
+                currentGrid.attach(keyBtn, c, 5 + r, (("width" in keydef) ? keydef.width : 1) * 2, r == 0 ? 3 : (("height" in keydef) ? keydef.height : 1) * 4);
+                keyBtn.visible = true;
+                c += (("width" in keydef) ? keydef.width : 1) * 2;
+                this.keys.push(keyBtn);
+                return;
+            }
             const i = ("key" in keydef) ? keycodes[keydef.key] : ("split" in keydef) ? "split" : "empty space";
             if (isPlainObject(i) && isPlainObject(i.layers)) {
                 if (i.layers.default == null) {
@@ -1170,6 +1196,13 @@ class Keyboard extends Dialog {
                 }
                 if (typeof i.layers.default !== 'string')
                     return;
+
+                // Store key name and media mapping for FN-layer switching
+                if ("key" in keydef) {
+                    i.keyName = keydef.key;
+                    if ("media" in keydef)
+                        i.mediaData = keydef.media;
+                }
 
                 let params = {
                     x_expand: true,
@@ -1700,37 +1733,68 @@ class Keyboard extends Dialog {
     }
 
     decideMod(i, mBtn) {
-        if (i.code === KeyCode.LEFT_CTRL || i.code === KeyCode.LEFT_ALT || i.code === KeyCode.RIGHT_CTRL ||
-            i.code === KeyCode.LEFT_SUPER || i.code === KeyCode.RIGHT_SUPER) {
+        // When FN is NOT active, media-mapped keys use their media code; otherwise use the F-key code.
+        const trueCode = (!this.fn && i.mediaData?.code) ? i.mediaData.code : i.code;
+
+        // Print Screen: hide keyboard instantly so it doesn't appear in the screenshot
+        if (trueCode === KeyCode.PRSC) {
+            this.close({ instant: true });
+            this.closedFromButton = true;
+            setTimeout(() => this.sendKey([trueCode]), 100);
+            return;
+        }
+
+        // FN toggle
+        if (i.code === KeyCode.FN) {
+            this.setFn(mBtn);
+            return;
+        }
+
+        if (trueCode === KeyCode.LEFT_CTRL || trueCode === KeyCode.LEFT_ALT || trueCode === KeyCode.RIGHT_CTRL ||
+            trueCode === KeyCode.LEFT_SUPER || trueCode === KeyCode.RIGHT_SUPER) {
             this.setNormMod(mBtn);
-        } else if (i.code === KeyCode.RIGHT_ALT) {
+        } else if (trueCode === KeyCode.RIGHT_ALT) {
             this.setAlt(mBtn);
-        } else if (i.code === KeyCode.LEFT_SHIFT || i.code === KeyCode.RIGHT_SHIFT) {
+        } else if (trueCode === KeyCode.LEFT_SHIFT || trueCode === KeyCode.RIGHT_SHIFT) {
             this.setShift(mBtn);
-        } else if (i.code === KeyCode.CAPS_LOCK || i.code === KeyCode.NUM_LOCK) {
+        } else if (trueCode === KeyCode.CAPS_LOCK || trueCode === KeyCode.NUM_LOCK) {
             this.sendKey([mBtn.char.code]);
         } else {
-            this.mod.push(i.code);
+            this.mod.push(trueCode);
             this.sendKey(this.mod);
             this.mod = [];
             this.modBtns.forEach(button => {
                 button.remove_style_class_name("selected");
             });
             this.shiftButtons.forEach(i => { i.remove_style_class_name("selected") })
+            if (this.fnButton)
+                this.fnButton.remove_style_class_name("selected");
             this.resetAllMod();
             this.modBtns = [];
         }
     }
 
     setCapsLock(button, state) {
-        if (state) {
-            button.add_style_class_name("selected");
-            this.capsL = true;
-        } else {
-            button.remove_style_class_name("selected");
-            this.capsL = false;
+        try {
+            if (button && button.get_stage && button.get_stage()) {
+                if (state) {
+                    button.add_style_class_name("selected");
+                    this.capsL = true;
+                } else {
+                    button.remove_style_class_name("selected");
+                    this.capsL = false;
+                }
+            } else {
+                this.capsL = !!state;
+            }
+        } catch (e) {
+            this.capsL = !!state;
         }
-        this.updateKeyLabels();
+        try {
+            this.updateKeyLabels();
+        } catch (e) {
+            logError(e, 'GJS-OSK: updateKeyLabels failed in setCapsLock');
+        }
     }
 
     setNumLock(button, state) {
@@ -1765,12 +1829,37 @@ class Keyboard extends Dialog {
         this.setNormMod(button);
     }
 
+    setFn(button) {
+        this.fn = !this.fn;
+        this.fnButton = button;
+        if (this.fn) {
+            button.add_style_class_name("selected");
+        } else {
+            button.remove_style_class_name("selected");
+        }
+        this.updateKeyLabels();
+    }
+
     updateKeyLabels() {
         this.keys.forEach(key => {
-            if (key.char != undefined) {
-                let layer = (this.alt ? 'alt' : '') + (this.shift ? 'shift' : '') + (this.numsL ? 'num' : '') + (this.capsL ? 'caps' : '') + (this.numsL || this.capsL ? 'lock' : '')
-                if (layer == '') layer = 'default'
-                key.label = key.char.layers[layer];
+            try {
+                if (key.char == undefined) return;
+                if (key.char.mediaData) {
+                    if (this.fn) {
+                        // FN active: show F-key label (FK01 → F1, etc.)
+                        const fkeyNum = parseInt((key.char.keyName || '').substring(2)) || '';
+                        key.label = fkeyNum ? `F${fkeyNum}` : (key.char.layers?.default || '');
+                    } else {
+                        // FN inactive: show media label
+                        key.label = key.char.mediaData.label || key.char.layers?.default || '';
+                    }
+                } else {
+                    let layer = (this.alt ? 'alt' : '') + (this.shift ? 'shift' : '') + (this.numsL ? 'num' : '') + (this.capsL ? 'caps' : '') + (this.numsL || this.capsL ? 'lock' : '')
+                    if (layer == '') layer = 'default'
+                    key.label = key.char.layers[layer];
+                }
+            } catch (e) {
+                logError(e, 'GJS-OSK: error updating key label');
             }
         });
     }
@@ -1800,6 +1889,9 @@ class Keyboard extends Dialog {
     resetAllMod() {
         this.shift = false;
         this.alt = false;
+        this.fn = false;
+        if (this.fnButton)
+            this.fnButton.remove_style_class_name("selected");
         this.updateKeyLabels()
     }
 }
