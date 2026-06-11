@@ -1197,8 +1197,13 @@ class Keyboard extends Dialog {
                 this.keys.push(keyBtn);
                 return;
             }
-            const i = ("key" in keydef) ? keycodes[keydef.key] : ("split" in keydef) ? "split" : "empty space";
-            if (isPlainObject(i) && isPlainObject(i.layers)) {
+            const keyInfo = ("key" in keydef) ? keycodes[keydef.key] : ("split" in keydef) ? "split" : "empty space";
+            if (isPlainObject(keyInfo) && isPlainObject(keyInfo.layers)) {
+                const i = {
+                    ...keyInfo,
+                    layers: { ...keyInfo.layers },
+                };
+
                 if (i.layers.default == null) {
                     for (const key of Object.keys(i.layers)) {
                         i.layers[key] = i.layers["_" + key]
@@ -1211,7 +1216,7 @@ class Keyboard extends Dialog {
                 if ("key" in keydef) {
                     i.keyName = keydef.key;
                     if ("media" in keydef)
-                        i.mediaData = keydef.media;
+                        i.mediaData = { ...keydef.media };
                 }
 
                 let params = {
@@ -1256,9 +1261,9 @@ class Keyboard extends Dialog {
                 keyBtn.visible = true
                 c += (("width" in keydef) ? keydef.width : 1) * 2
                 this.keys.push(keyBtn)
-            } else if (i == "empty space") {
+            } else if (keyInfo == "empty space") {
                 c += (("width" in keydef) ? keydef.width : 1) * 2
-            } else if (i == "split") {
+            } else if (keyInfo == "split") {
                 currentGrid = gridRight
                 if (!halfSize) halfSize = c
             }
