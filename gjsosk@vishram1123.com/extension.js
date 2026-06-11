@@ -67,7 +67,7 @@ const REPEATABLE_KEY_CODES = new Set([
     KeyCode.DELETE,
 ]);
 
-const SAFE_LAYOUT_ID_RE = /^[A-Za-z0-9_+-]+$/;
+const SAFE_LAYOUT_ID_RE = /^[A-Za-z0-9_+\-]+$/;
 
 class KeyboardMenuToggle extends QuickSettings.QuickMenuToggle {
     static {
@@ -245,7 +245,7 @@ export default class GjsOskExtension extends Extension {
 
     _closeKeyboard(instant) {
         if (this.Keyboard != null && this.Keyboard.state !== State.CLOSED && this.Keyboard.state !== State.CLOSING) {
-            this.Keyboard.close(!instant ? null : true);
+            this.Keyboard.close({ instant: !!instant });
             if (this.openBit != null && this.openBit.get_boolean('keyboard-visible'))
                 this.openBit.set_boolean('keyboard-visible', false);
         }
@@ -334,7 +334,10 @@ export default class GjsOskExtension extends Extension {
                     isTouchEventType(eventType),
                     true,
                 ][tapGestureMode];
-                this._syncKeyboardFocusAndVisibility();
+                if (eventType !== Clutter.EventType.MOTION &&
+                    eventType !== Clutter.EventType.TOUCH_UPDATE &&
+                    eventType !== Clutter.EventType.SCROLL)
+                    this._syncKeyboardFocusAndVisibility();
             }
         })
     }
@@ -348,6 +351,7 @@ export default class GjsOskExtension extends Extension {
         this.Keyboard = null;
         this.tapConnect = 0;
         this.keyFocusConnect = 0;
+        this.lastInputMethod = false;
 
         this.settings = this.getSettings();
         this.darkSchemeSettings = this.getSettings("org.gnome.desktop.interface");
@@ -513,14 +517,6 @@ export default class GjsOskExtension extends Extension {
                     this._indicator.destroy();
                     this._indicator = null;
                 }
-            }
-            if (this.tapConnect) {
-                global.stage.disconnect(this.tapConnect)
-                this.tapConnect = 0;
-            }
-            if (this.keyFocusConnect) {
-                global.stage.disconnect(this.keyFocusConnect);
-                this.keyFocusConnect = 0;
             }
             this._connectStageHandlers();
         }
@@ -941,7 +937,7 @@ class Keyboard extends Dialog {
         }
     }
 
-    close(instant = null) {
+    close({ instant = false } = {}) {
         this.prevKeyFocus = null;
         if (this.stateTimeout !== null) {
             clearTimeout(this.stateTimeout);
@@ -1044,6 +1040,14 @@ class Keyboard extends Dialog {
         const padding = this.settings.get_int("outer-spacing-px");
 
         return `background-color: rgba(${red},${green},${blue}, ${alpha}); padding: ${padding}px;`;
+    }
+
+    getAccentBackgroundStyle() {
+        const padding = this.settings.get_int("outer-spacing-px");
+        const fn = this.settings.scheme === "-dark"
+            ? 'st-darken(-st-accent-color, 30%)'
+            : 'st-lighten(-st-accent-color, 10%)';
+        return `background-color: ${fn}; padding: ${padding}px;`;
     }
 
     buildUI() {
@@ -1171,10 +1175,6 @@ class Keyboard extends Dialog {
 
         this.shiftButtons = [];
 
-        let width = 0;
-        for (const c of layoutRows[0]) {
-            width += (("width" in c) ? c.width : 1)
-        }
         let rowSize;
         let halfSize;
         let r = 0;
@@ -1267,13 +1267,9 @@ class Keyboard extends Dialog {
             left.add_style_class_name("boxLay");
             right.add_style_class_name("boxLay");
             if (this.settings.get_boolean("system-accent-col") && major >= 47) {
-                if (this.settings.scheme == "-dark") {
-                    left.set_style("background-color: st-darken(-st-accent-color, 30%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                    right.set_style("background-color: st-darken(-st-accent-color, 30%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                } else {
-                    left.set_style("background-color: st-lighten(-st-accent-color, 10%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                    right.set_style("background-color: st-lighten(-st-accent-color, 10%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                }
+                const accentStyle = this.getAccentBackgroundStyle();
+                left.set_style(accentStyle)
+                right.set_style(accentStyle)
             } else {
                 const backgroundStyle = this.getKeyboardBackgroundStyle();
                 left.set_style(backgroundStyle)
@@ -1371,11 +1367,7 @@ class Keyboard extends Dialog {
         } else {
             this.box.add_style_class_name("boxLay");
             if (this.settings.get_boolean("system-accent-col") && major >= 47) {
-                if (this.settings.scheme == "-dark") {
-                    this.box.set_style("background-color: st-darken(-st-accent-color, 30%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                } else {
-                    this.box.set_style("background-color: st-lighten(-st-accent-color, 10%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                }
+                this.box.set_style(this.getAccentBackgroundStyle())
             } else {
                 this.box.set_style(this.getKeyboardBackgroundStyle())
             }
