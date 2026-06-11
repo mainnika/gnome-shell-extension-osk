@@ -18,9 +18,31 @@ function clampIndex(index, length) {
 function readFileContents(path) {
 	try {
 		const [ok, contents] = GLib.file_get_contents(path);
-		return ok ? contents : null;
+		if (!ok)
+			return null;
+
+		return typeof contents === 'string' ? contents : new TextDecoder('utf-8').decode(contents);
 	} catch {
 		return null;
+	}
+}
+
+function normalizeCustomLayouts(rawValue) {
+	try {
+		const parsed = JSON.parse(rawValue || "[]");
+		if (!Array.isArray(parsed))
+			return [];
+
+		if (parsed.length > 0 &&
+			Array.isArray(parsed[0]) &&
+			typeof parsed[parsed.length - 1] === 'object' &&
+			!Array.isArray(parsed[parsed.length - 1]))
+			return [JSON.stringify(parsed)];
+
+		return parsed.filter(item => typeof item === 'string');
+	} catch (e) {
+		logError(e);
+		return [];
 	}
 }
 
@@ -59,15 +81,26 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		if (layoutList.length == 0)
 			layoutList = [_("Default")];
 
+		let customLayouts = normalizeCustomLayouts(settings.get_string("custom-layout") || "[]");
+		if (settings.get_string("custom-layout") !== JSON.stringify(customLayouts))
+			settings.set_string("custom-layout", JSON.stringify(customLayouts));
+
+		let layoutOptions = Object.keys(layouts);
+		for (let i = 0; i < customLayouts.length; i++)
+			layoutOptions.push(_("Custom Layout") + " " + (i + 1));
+		if (layoutOptions.length == 0)
+			layoutOptions = layoutList;
+		const hasSelectableLayouts = Object.keys(layouts).length > 0 || customLayouts.length > 0;
+
 		const layoutLandscapeRow = new Adw.ActionRow({
 			title: _('Landscape Layout')
 		});
 		layoutRow.add_row(layoutLandscapeRow);
 
-		let layoutLandscapeDrop = Gtk.DropDown.new_from_strings(layoutList);
+		let layoutLandscapeDrop = Gtk.DropDown.new_from_strings(layoutOptions);
 		layoutLandscapeDrop.valign = Gtk.Align.CENTER;
-		layoutLandscapeDrop.sensitive = Object.keys(layouts).length > 0;
-		let layoutLandscapeIndex = clampIndex(settings.get_int("layout-landscape"), layoutList.length);
+		layoutLandscapeDrop.sensitive = hasSelectableLayouts;
+		let layoutLandscapeIndex = clampIndex(settings.get_int("layout-landscape"), layoutOptions.length);
 		layoutLandscapeDrop.selected = layoutLandscapeIndex;
 		if (layoutLandscapeIndex != settings.get_int("layout-landscape"))
 			settings.set_int("layout-landscape", layoutLandscapeIndex);
@@ -80,16 +113,29 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		});
 		layoutRow.add_row(layoutPortraitRow);
 
-		let layoutPortraitDrop = Gtk.DropDown.new_from_strings(layoutList);
+		let layoutPortraitDrop = Gtk.DropDown.new_from_strings(layoutOptions);
 		layoutPortraitDrop.valign = Gtk.Align.CENTER;
-		layoutPortraitDrop.sensitive = Object.keys(layouts).length > 0;
-		let layoutPortraitIndex = clampIndex(settings.get_int("layout-portrait"), layoutList.length);
+		layoutPortraitDrop.sensitive = hasSelectableLayouts;
+		let layoutPortraitIndex = clampIndex(settings.get_int("layout-portrait"), layoutOptions.length);
 		layoutPortraitDrop.selected = layoutPortraitIndex;
 		if (layoutPortraitIndex != settings.get_int("layout-portrait"))
 			settings.set_int("layout-portrait", layoutPortraitIndex);
 
 		layoutPortraitRow.add_suffix(layoutPortraitDrop);
 		layoutPortraitRow.activatable_widget = layoutPortraitDrop;
+
+		const disableEdgeSwipeRow = new Adw.ActionRow({
+			title: _('Disable Edge Swipe')
+		});
+		behaviorGroup.add(disableEdgeSwipeRow);
+
+		const disableEdgeSwipeDT = new Gtk.Switch({
+			active: settings.get_boolean('disable-edge-swipe'),
+			valign: Gtk.Align.CENTER,
+		});
+
+		disableEdgeSwipeRow.add_suffix(disableEdgeSwipeDT);
+		disableEdgeSwipeRow.activatable_widget = disableEdgeSwipeDT;
 
 		const enableDragRow = new Adw.ActionRow({
 			title: _('Enable Dragging')
@@ -246,18 +292,83 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		defaultPosition.add_suffix(snapDrop);
 		defaultPosition.activatable_widget = snapDrop;
 
-		const soundPlayRow = new Adw.ActionRow({
-			title: _('Play sound')
+		const enableKeyRepeatRow = new Adw.ActionRow({
+			title: _('Enable Key Repeat for All Keys')
 		});
-		behaviorGroup.add(soundPlayRow);
+		behaviorGroup.add(enableKeyRepeatRow);
 
-		const soundPlayDT = new Gtk.Switch({
-			active: settings.get_boolean('play-sound'),
+		const enableKeyRepeatDT = new Gtk.Switch({
+			active: settings.get_boolean('enable-key-repeat'),
 			valign: Gtk.Align.CENTER,
 		});
 
-		soundPlayRow.add_suffix(soundPlayDT);
-		soundPlayRow.activatable_widget = soundPlayDT;
+		enableKeyRepeatRow.add_suffix(enableKeyRepeatDT);
+		enableKeyRepeatRow.activatable_widget = enableKeyRepeatDT;
+
+		const keyRepeatRateRow = new Adw.ActionRow({
+			title: _('Key Repeat Rate (ms)')
+		});
+		behaviorGroup.add(keyRepeatRateRow);
+
+		let numChanger_keyRepeat = Gtk.SpinButton.new_with_range(10, 1000, 10);
+		numChanger_keyRepeat.value = settings.get_int('key-repeat-rate');
+		numChanger_keyRepeat.valign = Gtk.Align.CENTER;
+		keyRepeatRateRow.add_suffix(numChanger_keyRepeat);
+		keyRepeatRateRow.activatable_widget = numChanger_keyRepeat;
+
+		const soundPlayRow = new Adw.ExpanderRow({
+			title: _('Play sound'),
+			show_enable_switch: true
+		});
+		soundPlayRow.enable_expansion = settings.get_boolean('play-sound');
+		behaviorGroup.add(soundPlayRow);
+
+		const fileRow = new Adw.ActionRow({
+			title: _('Sound file'),
+			subtitle: settings.get_string('sound-file') || _('No file selected'),
+			activatable: false,
+		});
+		const fileButton = new Gtk.Button({
+			label: settings.get_string('sound-file') ? _('Clear') : _('Choose'),
+			valign: Gtk.Align.CENTER,
+		});
+		fileRow.add_suffix(fileButton);
+		fileRow.activatable_widget = fileButton;
+		fileButton.connect('clicked', () => {
+			const currentPath = settings.get_string('sound-file');
+			if (currentPath) {
+				settings.set_string('sound-file', '');
+				fileRow.subtitle = _('No file selected');
+				fileButton.label = _('Choose');
+				return;
+			}
+
+			const fileChooser = new Gtk.FileChooserNative({
+				title: _('Select OGG File'),
+				transient_for: window,
+				action: Gtk.FileChooserAction.OPEN,
+				accept_label: _('Open'),
+				cancel_label: _('Cancel'),
+			});
+			const filter = new Gtk.FileFilter();
+			filter.add_mime_type('audio/ogg');
+			filter.set_name(_('OGG files'));
+			fileChooser.add_filter(filter);
+			fileChooser.connect('response', (dlg, response) => {
+				if (response === Gtk.ResponseType.ACCEPT) {
+					const file = dlg.get_file();
+					const path = file?.get_path();
+					if (path != null) {
+						settings.set_string('sound-file', path);
+						fileRow.subtitle = path;
+						fileButton.label = _('Clear');
+					}
+				}
+				dlg.destroy();
+			});
+			fileChooser.show();
+		});
+		soundPlayRow.add_row(fileRow);
 
 		const appearanceGroup = new Adw.PreferencesGroup({
 			title: _("Appearance")
@@ -403,6 +514,124 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 
 		window.add(page1);
 
+		const customLayoutPage = new Adw.PreferencesPage({
+			title: _("Custom Layouts"),
+			icon_name: "view-grid-symbolic",
+		});
+
+		const addLayoutGroup = new Adw.PreferencesGroup({
+			title: _("Add Layout"),
+		});
+		customLayoutPage.add(addLayoutGroup);
+
+		const customLayoutEntry = new Adw.EntryRow({
+			title: _("Paste Keyboard JSON"),
+		});
+		addLayoutGroup.add(customLayoutEntry);
+
+		const layoutEditorRow = new Adw.ActionRow({
+			title: _("Create/edit a custom keyboard layout"),
+		});
+		const layoutEditorLink = new Gtk.LinkButton({
+			label: _("Keyboard Layout Editor"),
+			uri: "https://vishram1123.github.io/gjs-osk",
+			valign: Gtk.Align.CENTER,
+		});
+		layoutEditorRow.add_suffix(layoutEditorLink);
+		layoutEditorRow.activatable_widget = layoutEditorLink;
+		addLayoutGroup.add(layoutEditorRow);
+
+		const addCustomLayoutButton = new Gtk.Button({
+			label: _("Add"),
+			valign: Gtk.Align.CENTER,
+		});
+		customLayoutEntry.add_suffix(addCustomLayoutButton);
+
+		const savedLayoutsGroup = new Adw.PreferencesGroup({
+			title: _("Layouts"),
+		});
+		customLayoutPage.add(savedLayoutsGroup);
+
+		const customLayoutsBox = new Gtk.Box({
+			orientation: Gtk.Orientation.VERTICAL,
+			spacing: 6,
+		});
+		savedLayoutsGroup.add(customLayoutsBox);
+
+		const refreshLayoutDropdowns = () => {
+			layoutOptions = Object.keys(layouts);
+			for (let i = 0; i < customLayouts.length; i++)
+				layoutOptions.push(_("Custom Layout") + " " + (i + 1));
+			if (layoutOptions.length == 0)
+				layoutOptions = [_("Default")];
+
+			layoutLandscapeDrop.set_model(Gtk.StringList.new(layoutOptions));
+			layoutPortraitDrop.set_model(Gtk.StringList.new(layoutOptions));
+			layoutLandscapeDrop.sensitive = Object.keys(layouts).length > 0 || customLayouts.length > 0;
+			layoutPortraitDrop.sensitive = Object.keys(layouts).length > 0 || customLayouts.length > 0;
+			layoutLandscapeDrop.selected = clampIndex(settings.get_int("layout-landscape"), layoutOptions.length);
+			layoutPortraitDrop.selected = clampIndex(settings.get_int("layout-portrait"), layoutOptions.length);
+		};
+
+		const rebuildCustomLayoutRows = () => {
+			let child;
+			while ((child = customLayoutsBox.get_first_child()) != null)
+				customLayoutsBox.remove(child);
+
+			for (let i = 0; i < customLayouts.length; i++) {
+				const json = customLayouts[i];
+				const row = new Adw.ActionRow({
+					title: _("Custom Layout") + " " + (i + 1),
+					subtitle: json,
+				});
+				const editButton = new Gtk.Button({
+					icon_name: "document-edit-symbolic",
+					valign: Gtk.Align.CENTER,
+				});
+				editButton.connect("clicked", () => {
+					customLayoutEntry.set_text(json);
+				});
+				const deleteButton = new Gtk.Button({
+					icon_name: "user-trash-symbolic",
+					valign: Gtk.Align.CENTER,
+				});
+				deleteButton.connect("clicked", () => {
+					customLayouts.splice(i, 1);
+					settings.set_string("custom-layout", JSON.stringify(customLayouts));
+					refreshLayoutDropdowns();
+					rebuildCustomLayoutRows();
+				});
+				row.add_suffix(editButton);
+				row.add_suffix(deleteButton);
+				customLayoutsBox.append(row);
+			}
+		};
+
+		addCustomLayoutButton.connect("clicked", () => {
+			const rawJson = customLayoutEntry.get_text();
+			try {
+				const parsed = JSON.parse(rawJson);
+				if (!Array.isArray(parsed) || parsed.length == 0)
+					throw new Error("Custom layout must be a non-empty JSON array");
+
+				const lastRow = parsed[parsed.length - 1];
+				if (typeof lastRow !== "object" || Array.isArray(lastRow))
+					parsed.push({ split: false, settings: true, close: true });
+
+				const json = JSON.stringify(parsed);
+				customLayouts.push(json);
+				settings.set_string("custom-layout", JSON.stringify(customLayouts));
+				customLayoutEntry.set_text("");
+				refreshLayoutDropdowns();
+				rebuildCustomLayoutRows();
+			} catch (e) {
+				logError(e, "Failed to add GJS OSK custom layout");
+			}
+		});
+
+		rebuildCustomLayoutRows();
+		window.add(customLayoutPage);
+
 		let page2 = new Adw.PreferencesPage({
 			title: _("About"),
 			icon_name: 'info-symbolic',
@@ -476,6 +705,7 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 
 		settings.bind("layout-landscape", layoutLandscapeDrop, "selected", 0);
 		settings.bind("layout-portrait", layoutPortraitDrop, "selected", 0);
+		settings.bind("disable-edge-swipe", disableEdgeSwipeDT, "active", 0);
 		settings.bind("enable-drag", dragEnableDT, "active", 0);
 		settings.bind("enable-tap-gesture", dragOpt, "selected", 0);
 		settings.bind("indicator-enabled", indEnabled, "active", 0);
@@ -501,7 +731,9 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		settings.bind("outer-spacing-px", numChanger_outer, "value", 0);
 		settings.bind("snap-spacing-px", numChanger_snap, "value", 0)
 		settings.bind("round-key-corners", roundKeyCDT, "active", 0);
-		settings.bind("play-sound", soundPlayDT, "active", 0);
+		settings.bind("enable-key-repeat", enableKeyRepeatDT, "active", 0);
+		settings.bind("key-repeat-rate", numChanger_keyRepeat, "value", 0);
+		settings.bind("play-sound", soundPlayRow, "enable-expansion", 0);
 		settings.bind("show-icons", showIconDT, "active", 0)
 		settings.bind("default-snap", snapDrop, "selected", 0);
 		const writeMonitorSetting = () => {
@@ -525,6 +757,7 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 		window.connect("close-request", () => {
 			settings.set_int("layout-landscape", layoutLandscapeDrop.selected);
 			settings.set_int("layout-portrait", layoutPortraitDrop.selected);
+			settings.set_boolean("disable-edge-swipe", disableEdgeSwipeDT.active);
 			settings.set_boolean("enable-drag", dragEnableDT.active);
 			settings.set_int("enable-tap-gesture", dragOpt.selected);
 			settings.set_boolean("indicator-enabled", indEnabled.active);
@@ -546,7 +779,9 @@ export default class GjsOskPreferences extends ExtensionPreferences {
 			settings.set_int("outer-spacing-px", numChanger_outer.value);
 			settings.set_int("snap-spacing-px", numChanger_snap.value)
 			settings.set_boolean("round-key-corners", roundKeyCDT.active);
-			settings.set_boolean("play-sound", soundPlayDT.active);
+			settings.set_boolean("enable-key-repeat", enableKeyRepeatDT.active);
+			settings.set_int("key-repeat-rate", numChanger_keyRepeat.value);
+			settings.set_boolean("play-sound", soundPlayRow.enable_expansion);
 			settings.set_boolean("show-icons", showIconDT.active)
 			settings.set_int("default-snap", snapDrop.selected);
 			writeMonitorSetting()
