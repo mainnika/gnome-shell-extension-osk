@@ -26,6 +26,49 @@ const State = {
     CLOSING: 3,
 };
 
+const KeyCode = {
+    BACKSPACE: 14,
+    LEFT_CTRL: 29,
+    LEFT_SHIFT: 42,
+    RIGHT_SHIFT: 54,
+    LEFT_ALT: 56,
+    CAPS_LOCK: 58,
+    NUM_LOCK: 69,
+    RIGHT_CTRL: 97,
+    RIGHT_ALT: 100,
+    UP: 103,
+    LEFT: 105,
+    RIGHT: 106,
+    DOWN: 108,
+    DELETE: 111,
+    LEFT_SUPER: 125,
+    RIGHT_SUPER: 126,
+};
+
+const MODIFIER_KEY_CODES = new Set([
+    KeyCode.LEFT_SHIFT,
+    KeyCode.RIGHT_SHIFT,
+    KeyCode.LEFT_CTRL,
+    KeyCode.LEFT_SUPER,
+    KeyCode.RIGHT_SUPER,
+    KeyCode.LEFT_ALT,
+    KeyCode.RIGHT_ALT,
+    KeyCode.RIGHT_CTRL,
+    KeyCode.CAPS_LOCK,
+    KeyCode.NUM_LOCK,
+]);
+
+const REPEATABLE_KEY_CODES = new Set([
+    KeyCode.BACKSPACE,
+    KeyCode.UP,
+    KeyCode.LEFT,
+    KeyCode.RIGHT,
+    KeyCode.DOWN,
+    KeyCode.DELETE,
+]);
+
+const SAFE_LAYOUT_ID_RE = /^[A-Za-z0-9_+-]+$/;
+
 class KeyboardMenuToggle extends QuickSettings.QuickMenuToggle {
     static {
         GObject.registerClass(this);
@@ -46,11 +89,9 @@ class KeyboardMenuToggle extends QuickSettings.QuickMenuToggle {
         this._itemsSection.addMenuItem(new PopupMenu.PopupImageMenuItem(_('Never'), this.settings.get_int("enable-tap-gesture") == 0 ? 'emblem-ok-symbolic' : null));
         this._itemsSection.addMenuItem(new PopupMenu.PopupImageMenuItem(_("Only on Touch"), this.settings.get_int("enable-tap-gesture") == 1 ? 'emblem-ok-symbolic' : null));
         this._itemsSection.addMenuItem(new PopupMenu.PopupImageMenuItem(_("Always"), this.settings.get_int("enable-tap-gesture") == 2 ? 'emblem-ok-symbolic' : null));
-        for (var i in this._itemsSection._getMenuItems()) {
-            const item = this._itemsSection._getMenuItems()[i]
-            const num = i
+        this._itemsSection._getMenuItems().forEach((item, num) => {
             item.connect('activate', () => this.settings.set_int("enable-tap-gesture", num))
-        }
+        });
 
         this.menu.addMenuItem(this._itemsSection);
         this.settings.bind('indicator-enabled',
@@ -64,9 +105,9 @@ class KeyboardMenuToggle extends QuickSettings.QuickMenuToggle {
     }
 
     _refresh() {
-        for (var i in this._itemsSection._getMenuItems()) {
-            this._itemsSection._getMenuItems()[i].setIcon(this.settings.get_int("enable-tap-gesture") == i ? 'emblem-ok-symbolic' : null)
-        }
+        this._itemsSection._getMenuItems().forEach((item, index) => {
+            item.setIcon(this.settings.get_int("enable-tap-gesture") === index ? 'emblem-ok-symbolic' : null);
+        });
     }
 };
 
@@ -75,7 +116,6 @@ let keycodes;
 let layouts;
 let currentMonitorId = 0;
 let extract_dir = GLib.get_user_cache_dir() + "/gjs-osk";
-// [insert handwriting 1]
 
 function clampIndex(index, length) {
     if (!Number.isFinite(index) || index < 0 || index >= length)
@@ -93,6 +133,59 @@ function readFileContents(path) {
     } catch {
         return null;
     }
+}
+
+function safeLayoutId(layoutId) {
+    const id = `${layoutId ?? "us"}`;
+    if (SAFE_LAYOUT_ID_RE.test(id))
+        return id;
+
+    logError(new Error(`Ignoring unsafe keyboard layout id: ${id}`));
+    return "us";
+}
+
+function isPlainObject(value) {
+    return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasValidDimension(keydef, name) {
+    return !(name in keydef) || (typeof keydef[name] === 'number' && Number.isFinite(keydef[name]) && keydef[name] > 0);
+}
+
+function isValidKeyDef(keydef) {
+    return isPlainObject(keydef) &&
+        hasValidDimension(keydef, "width") &&
+        hasValidDimension(keydef, "height") &&
+        (!("key" in keydef) || typeof keydef.key === 'string') &&
+        (!("split" in keydef) || typeof keydef.split === 'boolean');
+}
+
+function isValidLayoutCell(cell) {
+    if (Array.isArray(cell))
+        return cell.length > 0 && cell.every(isValidKeyDef);
+
+    return isValidKeyDef(cell);
+}
+
+function getLayoutRows(layout) {
+    if (!Array.isArray(layout))
+        return [];
+
+    const metadata = layout[layout.length - 1];
+    return isPlainObject(metadata) ? layout.slice(0, -1) : layout;
+}
+
+function isValidLayout(layout) {
+    const rows = getLayoutRows(layout);
+    return rows.length > 0 &&
+        rows.every(row => Array.isArray(row) && row.length > 0 && row.every(isValidLayoutCell));
+}
+
+function isTouchEventType(eventType) {
+    return eventType === Clutter.EventType.TOUCH_BEGIN ||
+        eventType === Clutter.EventType.TOUCH_UPDATE ||
+        eventType === Clutter.EventType.TOUCH_END ||
+        eventType === Clutter.EventType.TOUCH_CANCEL;
 }
 
 function normalizeCustomLayouts(rawValue) {
@@ -144,7 +237,7 @@ function getCurrentMonitor() {
 export default class GjsOskExtension extends Extension {
     _openKeyboard(instant) {
         if (this.Keyboard != null && this.Keyboard.state !== State.OPENED && this.Keyboard.state !== State.OPENING) {
-            this.Keyboard.open(null, !instant ? null : true);
+            this.Keyboard.open({ instant: !!instant });
             if (this.openBit != null && !this.openBit.get_boolean('keyboard-visible'))
                 this.openBit.set_boolean('keyboard-visible', true);
         }
@@ -192,40 +285,56 @@ export default class GjsOskExtension extends Extension {
         return indicator;
     }
 
-    open_interval() {
+    _raiseKeyboard() {
+        if (this.Keyboard == null)
+            return;
+
+        const parent = this.Keyboard.get_parent();
+        if (parent != null)
+            parent.set_child_at_index(this.Keyboard, parent.get_n_children() - 1);
+        this.Keyboard.set_child_at_index(this.Keyboard.box, this.Keyboard.get_n_children() - 1);
+    }
+
+    _syncKeyboardFocusAndVisibility() {
+        if (this.Keyboard == null)
+            return;
+
+        if (global.stage.key_focus == this.Keyboard && this.Keyboard.prevKeyFocus != null)
+            global.stage.key_focus = this.Keyboard.prevKeyFocus;
+
+        this._raiseKeyboard();
+        if (!this.Keyboard.openedFromButton && this.lastInputMethod) {
+            if (Main.inputMethod.currentFocus != null && Main.inputMethod.currentFocus.is_focused() && !this.Keyboard.closedFromButton) {
+                this._openKeyboard();
+            } else if (!this.Keyboard.closedFromButton && !this.Keyboard._dragging) {
+                this._closeKeyboard();
+                this.Keyboard.closedFromButton = false;
+            } else if (Main.inputMethod.currentFocus == null) {
+                this.Keyboard.closedFromButton = false;
+            }
+        }
+    }
+
+    _connectStageHandlers() {
         if (this.tapConnect) {
             global.stage.disconnect(this.tapConnect)
             this.tapConnect = 0;
         }
-        if (this.openInterval !== null) {
-            clearInterval(this.openInterval);
-            this.openInterval = null;
+        if (this.keyFocusConnect) {
+            global.stage.disconnect(this.keyFocusConnect);
+            this.keyFocusConnect = 0;
         }
-        this.openInterval = setInterval(() => {
-            if (this.Keyboard != null) {
-                if (global.stage.key_focus == this.Keyboard && this.Keyboard.prevKeyFocus != null) {
-                    global.stage.key_focus = this.Keyboard.prevKeyFocus
-                }
-                const parent = this.Keyboard.get_parent();
-                if (parent != null)
-                    parent.set_child_at_index(this.Keyboard, parent.get_n_children() - 1);
-                this.Keyboard.set_child_at_index(this.Keyboard.box, this.Keyboard.get_n_children() - 1);
-                if (!this.Keyboard.openedFromButton && this.lastInputMethod) {
-                    if (Main.inputMethod.currentFocus != null && Main.inputMethod.currentFocus.is_focused() && !this.Keyboard.closedFromButton) {
-                        this._openKeyboard();
-                    } else if (!this.Keyboard.closedFromButton && !this.Keyboard._dragging) {
-                        this._closeKeyboard();
-                        this.Keyboard.closedFromButton = false
-                    } else if (Main.inputMethod.currentFocus == null) {
-                        this.Keyboard.closedFromButton = false
-                    }
-                }
-            }
-        }, 300);
+        this.keyFocusConnect = global.stage.connect('notify::key-focus', () => this._syncKeyboardFocusAndVisibility());
         this.tapConnect = global.stage.connect("event", (_actor, event) => {
-            if (event.type() !== 4 && event.type() !== 5) {
+            const eventType = event.type();
+            if (eventType !== Clutter.EventType.ENTER && eventType !== Clutter.EventType.LEAVE) {
                 const tapGestureMode = this.settings.get_boolean("indicator-enabled") ? this.settings.get_int("enable-tap-gesture") : 0;
-                this.lastInputMethod = [false, event.type() >= 9 && event.type() <= 12, true][tapGestureMode]
+                this.lastInputMethod = [
+                    false,
+                    isTouchEventType(eventType),
+                    true,
+                ][tapGestureMode];
+                this._syncKeyboardFocusAndVisibility();
             }
         })
     }
@@ -237,8 +346,8 @@ export default class GjsOskExtension extends Extension {
         this._restoreOpenAfterRefresh = false;
         this._inputSourceRefreshTimeout = 0;
         this.Keyboard = null;
-        this.openInterval = null;
         this.tapConnect = 0;
+        this.keyFocusConnect = 0;
 
         this.settings = this.getSettings();
         this.darkSchemeSettings = this.getSettings("org.gnome.desktop.interface");
@@ -278,22 +387,21 @@ export default class GjsOskExtension extends Extension {
             if (this.settings.get_string("custom-layout") !== JSON.stringify(this.customLayouts))
                 this.settings.set_string("custom-layout", JSON.stringify(this.customLayouts));
 
-            // [insert handwriting 2]
-            let currentMonitors = this.settings.get_string("default-monitor").split(";").filter(i => i.includes(":"))
-            let currentMonitorMap = {};
-            let monitors = Main.layoutManager.monitors ?? [];
-            for (var i of currentMonitors) {
-                let tmp = i.split(":");
+            const currentMonitors = this.settings.get_string("default-monitor").split(";").filter(i => i.includes(":"))
+            const currentMonitorMap = {};
+            const monitors = Main.layoutManager.monitors ?? [];
+            for (const i of currentMonitors) {
+                const tmp = i.split(":");
                 if (tmp[0] !== "" && tmp[1] !== "")
                     currentMonitorMap[tmp[0]] = tmp[1] + "";
             }
             if (!Object.keys(currentMonitorMap).includes(monitors.length + "")) {
-                let allConfigs = Object.keys(currentMonitorMap).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+                const allConfigs = Object.keys(currentMonitorMap).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
                 if (allConfigs.length > 0)
                     currentMonitorMap[monitors.length + ""] = currentMonitorMap[allConfigs[allConfigs.length - 1] + ""];
             }
             try {
-                let connector = currentMonitorMap[monitors.length + ""];
+                const connector = currentMonitorMap[monitors.length + ""];
                 currentMonitorId = connector != null ? global.backend.get_monitor_manager().get_monitor_for_connector(connector) : Main.layoutManager.primaryIndex;
                 if (currentMonitorId == null || currentMonitorId < 0 || currentMonitorId >= monitors.length) {
                     currentMonitorId = 0;
@@ -302,7 +410,7 @@ export default class GjsOskExtension extends Extension {
                 currentMonitorId = 0;
             }
             const currentSource = this.inputLanguageSettings.currentSource;
-            const currentLayoutId = currentSource?.xkbId ?? KeyboardManager.getKeyboardManager().currentLayout?.id ?? "us";
+            const currentLayoutId = safeLayoutId(currentSource?.xkbId ?? KeyboardManager.getKeyboardManager().currentLayout?.id ?? "us");
             const keycodesPath = extract_dir + "/keycodes/" + currentLayoutId + '.json';
             const fallbackKeycodesPath = extract_dir + "/keycodes/us.json";
             let postExtract = () => {
@@ -362,7 +470,7 @@ export default class GjsOskExtension extends Extension {
         this._quick_settings_indicator = new QuickSettings.SystemIndicator();
         this._quick_settings_indicator.quickSettingsItems.push(this._toggle);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._quick_settings_indicator);
-        this.open_interval();
+        this._connectStageHandlers();
         this.keyboardVisibilityHandler = this.openBit.connect('changed::keyboard-visible', () => {
             const shouldBeVisible = this.openBit.get_boolean('keyboard-visible');
             if (this.Keyboard == null)
@@ -410,11 +518,11 @@ export default class GjsOskExtension extends Extension {
                 global.stage.disconnect(this.tapConnect)
                 this.tapConnect = 0;
             }
-            if (this.openInterval !== null) {
-                clearInterval(this.openInterval);
-                this.openInterval = null;
+            if (this.keyFocusConnect) {
+                global.stage.disconnect(this.keyFocusConnect);
+                this.keyFocusConnect = 0;
             }
-            this.open_interval();
+            this._connectStageHandlers();
         }
         this.settingsHandlers = [
             this.settings.connect("changed", settingsChanged),
@@ -473,9 +581,9 @@ export default class GjsOskExtension extends Extension {
             global.stage.disconnect(this.tapConnect)
             this.tapConnect = 0;
         }
-        if (this.openInterval !== null) {
-            clearInterval(this.openInterval);
-            this.openInterval = null;
+        if (this.keyFocusConnect) {
+            global.stage.disconnect(this.keyFocusConnect);
+            this.keyFocusConnect = 0;
         }
         if (this._inputSourceRefreshTimeout) {
             GLib.source_remove(this._inputSourceRefreshTimeout);
@@ -489,7 +597,6 @@ export default class GjsOskExtension extends Extension {
         this.darkSchemeSettings = null;
         this.inputLanguageSettings = null;
         this.gnomeKeyboardSettings = null;
-        this.Keyboard = null
         keycodes = null
         if (this._originalLastDeviceIsTouchscreen !== null) {
             KeyboardUI.KeyboardManager.prototype._lastDeviceIsTouchscreen = this._originalLastDeviceIsTouchscreen;
@@ -497,8 +604,6 @@ export default class GjsOskExtension extends Extension {
         }
     }
 }
-
-// [insert handwriting 3]
 
 class Keyboard extends Dialog {
     static [GObject.signals] = {
@@ -526,7 +631,6 @@ class Keyboard extends Dialog {
         this.capsL = false;
         this.shift = false;
         this.alt = false;
-        this.textboxChecker = null;
         this.stateTimeout = null;
         this.keyTimeout = null;
         this.keyTimeoutFunc = null;
@@ -545,7 +649,6 @@ class Keyboard extends Dialog {
         this.nonDragBlocker = new Clutter.Actor();
         this.buildUI();
         this.draggable = false;
-        // [insert handwriting 4]
         this.add_child(this.box);
         this.setInitialClosedState();
         this.box.set_name("osk-gjs")
@@ -586,14 +689,14 @@ class Keyboard extends Dialog {
                 return mode & Main.actionMode;
             });
             bottomDragAction.connect('end', () => {
-                this.open(true);
+                this.open({ prepare: false });
                 this.openedFromButton = true;
                 this.closedFromButton = false;
                 this.gestureInProgress = false;
             });
             bottomDragAction.connect('progress', (_action, progress) => {
                 if (!this.gestureInProgress)
-                    this.open(false)
+                    this.open({ animate: false })
                 this.setOpenState(Math.min(Math.max(0, (progress / (side % 2 == 0 ? this.box.height : this.box.width)) * 100), 100))
                 this.gestureInProgress = true;
             });
@@ -614,8 +717,13 @@ class Keyboard extends Dialog {
         this._oldMaybeHandleEvent = Main.keyboard.maybeHandleEvent
         this._maybeHandleEvent = (e) => {
             const tapGestureMode = this.settings.get_boolean("indicator-enabled") ? this.settings.get_int("enable-tap-gesture") : 0;
-            let lastInputMethod = [e.type() == 11, e.type() == 11, e.type() == 7 || e.type() == 11][tapGestureMode]
-            let ac = global.stage.get_event_actor(e)
+            const eventType = e.type();
+            const lastInputMethod = [
+                eventType === Clutter.EventType.TOUCH_BEGIN,
+                eventType === Clutter.EventType.TOUCH_BEGIN,
+                eventType === Clutter.EventType.BUTTON_PRESS || eventType === Clutter.EventType.TOUCH_BEGIN,
+            ][tapGestureMode];
+            const ac = global.stage.get_event_actor(e)
             if (this.contains(ac)) {
                 ac.event(e, true);
                 ac.event(e, false);
@@ -635,10 +743,6 @@ class Keyboard extends Dialog {
             global.stage.remove_action(this.bottomDragAction)
         if (this.oldBottomDragAction !== null && this.oldBottomDragAction instanceof Clutter.Action)
             global.stage.add_action_full('osk', Clutter.EventPhase.CAPTURE, this.oldBottomDragAction)
-        if (this.textboxChecker !== null) {
-            clearInterval(this.textboxChecker);
-            this.textboxChecker = null;
-        }
         if (this.stateTimeout !== null) {
             clearTimeout(this.stateTimeout);
             this.stateTimeout = null;
@@ -720,14 +824,15 @@ class Keyboard extends Dialog {
 
     connectMoveHandle(moveHandle) {
         moveHandle.connect("event", (_actor, event) => {
-            if (event.type() == Clutter.EventType.BUTTON_PRESS || event.type() == Clutter.EventType.TOUCH_BEGIN) {
+            const eventType = event.type();
+            if (eventType === Clutter.EventType.BUTTON_PRESS || eventType === Clutter.EventType.TOUCH_BEGIN) {
                 this.draggable = this.settings.get_boolean("enable-drag");
                 let [eventX, eventY] = event.get_coords();
                 this.delta = [eventX - this.translation_x, eventY - this.translation_y];
                 return this.startDragging(event, this.delta);
-            } else if (event.type() == Clutter.EventType.TOUCH_UPDATE && this._dragging) {
+            } else if (eventType === Clutter.EventType.TOUCH_UPDATE && this._dragging) {
                 return this.motionEvent(event);
-            } else if ((event.type() == Clutter.EventType.TOUCH_END || event.type() == Clutter.EventType.TOUCH_CANCEL) && this._dragging) {
+            } else if ((eventType === Clutter.EventType.TOUCH_END || eventType === Clutter.EventType.TOUCH_CANCEL) && this._dragging) {
                 return this.endDragging();
             }
 
@@ -737,7 +842,7 @@ class Keyboard extends Dialog {
 
     snapMovement(xPos, yPos) {
         let monitor = getCurrentMonitor()
-        if (xPos < monitor.x || yPos < monitor.y || xPos > monitor.x + monitor.width || yPos > monitor.y + monitor.width) {
+        if (xPos < monitor.x || yPos < monitor.y || xPos > monitor.x + monitor.width || yPos > monitor.y + monitor.height) {
             this.set_translation(xPos, yPos, 0);
             return;
         }
@@ -786,31 +891,31 @@ class Keyboard extends Dialog {
         this.state = State.CLOSED;
     }
 
-    open(noPrep = null, instant = null) {
+    open({ prepare = true, animate = true, instant = false } = {}) {
         if (this.updateCapsLock) this.updateCapsLock()
         if (this.updateNumLock) this.updateNumLock()
         if (this.stateTimeout !== null) {
             clearTimeout(this.stateTimeout);
             this.stateTimeout = null;
         }
-        if (noPrep == null || !noPrep) {
+        if (prepare) {
             this.prevKeyFocus = global.stage.key_focus
             this.inputDevice = Clutter.get_default_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
             this.state = State.OPENING
             this.show();
         }
-        if (noPrep == null || noPrep) {
+        if (animate) {
             let monitor = getCurrentMonitor();
             let posX = [this.settings.get_int("snap-spacing-px"), ((monitor.width * .5) - ((this.width * .5))), monitor.width - this.width - this.settings.get_int("snap-spacing-px")][(this.settings.get_int("default-snap") % 3)];
             let posY = [this.settings.get_int("snap-spacing-px"), ((monitor.height * .5) - ((this.height * .5))), monitor.height - this.height - this.settings.get_int("snap-spacing-px")][Math.floor((this.settings.get_int("default-snap") / 3))];
-            if (noPrep == null) {
+            if (prepare) {
                 let mX = [-this.box.width, 0, this.box.width][(this.settings.get_int("default-snap") % 3)];
                 let mY = [-this.box.height, 0, this.box.height][Math.floor((this.settings.get_int("default-snap") / 3))]
                 this.set_translation(posX + mX + monitor.x, posY + mY + monitor.y, 0)
             }
             this.box.ease({
                 opacity: 255,
-                duration: instant == null || !instant ? 100 : 0,
+                duration: instant ? 0 : 100,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 onComplete: () => {
                     this.stateTimeout = setTimeout(() => {
@@ -821,7 +926,7 @@ class Keyboard extends Dialog {
             this.ease({
                 translation_x: posX + monitor.x,
                 translation_y: posY + monitor.y,
-                duration: instant == null || !instant ? 100 : 0,
+                duration: instant ? 0 : 100,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD
             })
             if (!this.settings.get_boolean("enable-drag") && this.nonDragBlocker !== null) {
@@ -833,7 +938,6 @@ class Keyboard extends Dialog {
             this.opened = true;
             if (this.extensionObject.openBit != null && !this.extensionObject.openBit.get_boolean('keyboard-visible'))
                 this.extensionObject.openBit.set_boolean('keyboard-visible', true);
-            // [insert handwriting 5]
         }
     }
 
@@ -851,7 +955,7 @@ class Keyboard extends Dialog {
         this.state = State.CLOSING
         this.box.ease({
             opacity: 0,
-            duration: instant == null || !instant ? 100 : 0,
+            duration: instant ? 0 : 100,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => {
                 this.opened = false;
@@ -864,20 +968,16 @@ class Keyboard extends Dialog {
         this.ease({
             translation_x: posX + mX + monitor.x,
             translation_y: posY + mY + monitor.y,
-            duration: instant == null || !instant ? 100 : 0,
+            duration: instant ? 0 : 100,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD
         })
         if (!this.settings.get_boolean("enable-drag") && this.nonDragBlocker !== null) {
-            Main.layoutManager.removeChrome(this.nonDragBlocker, {
-                affectsStruts: true,
-                trackFullscreen: true,
-            })
+            Main.layoutManager.removeChrome(this.nonDragBlocker)
         }
         this.openedFromButton = false
         this.releaseAllKeys();
         if (this.extensionObject.openBit != null && this.extensionObject.openBit.get_boolean('keyboard-visible'))
             this.extensionObject.openBit.set_boolean('keyboard-visible', false);
-        // [insert handwrting 6]
     }
 
     vfunc_button_press_event(event) {
@@ -905,19 +1005,45 @@ class Keyboard extends Dialog {
     vfunc_touch_event(event) {
         let sequence = event.get_event_sequence?.() ?? null;
 
-        if (!this._dragging && event.type() == Clutter.EventType.TOUCH_BEGIN) {
+        const eventType = event.type();
+        if (!this._dragging && eventType === Clutter.EventType.TOUCH_BEGIN) {
             this.delta = [event.get_coords()[0] - this.translation_x, event.get_coords()[1] - this.translation_y];
             this.startDragging(event, this.delta);
             return Clutter.EVENT_STOP;
         } else if (this._grabbedSequence && sequence != null && sequence.get_slot() === this._grabbedSequence.get_slot()) {
-                if (event.type() == Clutter.EventType.TOUCH_UPDATE) {
+                if (eventType === Clutter.EventType.TOUCH_UPDATE) {
                     return this.motionEvent(event);
-                } else if (event.type() == Clutter.EventType.TOUCH_END || event.type() == Clutter.EventType.TOUCH_CANCEL) {
+                } else if (eventType === Clutter.EventType.TOUCH_END || eventType === Clutter.EventType.TOUCH_CANCEL) {
                     return this.endDragging();
                 }
         }
 
         return Clutter.EVENT_PROPAGATE;
+    }
+
+    getKeyStyle(radius = null) {
+        const fontSize = this.settings.get_int("font-size-px");
+        const borderSpacing = this.settings.get_int("border-spacing-px");
+        const borderRadius = radius ??
+            (this.settings.get_boolean("round-key-corners") ? `${borderSpacing + 5}px` : "0");
+        const fontWeight = this.settings.get_boolean("font-bold") ? "bold" : "normal";
+
+        return `font-size: ${fontSize}px; border-radius: ${borderRadius}; background-size: ${fontSize}px; font-weight: ${fontWeight}; border: ${borderSpacing}px solid transparent;`;
+    }
+
+    getMoveHandleStyle() {
+        return this.getKeyStyle(this.settings.get_boolean("round-key-corners") ? "5px" : "0");
+    }
+
+    getKeyboardBackgroundStyle() {
+        const suffix = this.settings.scheme;
+        const red = this.settings.get_double("background-r" + suffix);
+        const green = this.settings.get_double("background-g" + suffix);
+        const blue = this.settings.get_double("background-b" + suffix);
+        const alpha = this.settings.get_double("background-a" + suffix);
+        const padding = this.settings.get_int("outer-spacing-px");
+
+        return `background-color: rgba(${red},${green},${blue}, ${alpha}); padding: ${padding}px;`;
     }
 
     buildUI() {
@@ -946,13 +1072,16 @@ class Keyboard extends Dialog {
             }
         }
 
-        if (!Array.isArray(currentLayout) || currentLayout.length === 0)
-            return;
+        if (!isValidLayout(currentLayout)) {
+            logError(new Error(`Invalid layout data for ${layoutName}`));
+            layoutName = layoutNames[0] ?? "";
+            currentLayout = layouts[layoutName];
+            if (!isValidLayout(currentLayout))
+                return;
+        }
 
         const layoutMetadata = getLayoutMetadata(currentLayout, layoutName);
-        const layoutRows = (typeof currentLayout[currentLayout.length - 1] === 'object' && !Array.isArray(currentLayout[currentLayout.length - 1]))
-            ? currentLayout.slice(0, -1)
-            : currentLayout;
+        const layoutRows = getLayoutRows(currentLayout);
 
         this.box.width = Math.round((monitor.width - this.settings.get_int("snap-spacing-px") * 2) * (layoutMetadata.split ? 1 : this.widthPercent))
         this.box.height = Math.round((monitor.height - this.settings.get_int("snap-spacing-px") * 2) * this.heightPercent)
@@ -1041,7 +1170,6 @@ class Keyboard extends Dialog {
         }
 
         this.shiftButtons = [];
-        // [insert handwriting 7]
 
         let width = 0;
         for (const c of layoutRows[0]) {
@@ -1053,12 +1181,15 @@ class Keyboard extends Dialog {
         let c;
         const doAddKey = (keydef) => {
             const i = ("key" in keydef) ? keycodes[keydef.key] : ("split" in keydef) ? "split" : "empty space";
-            if (i != null && typeof i !== 'string') {
+            if (isPlainObject(i) && isPlainObject(i.layers)) {
                 if (i.layers.default == null) {
-                    for (var key of Object.keys(i.layers)) {
+                    for (const key of Object.keys(i.layers)) {
                         i.layers[key] = i.layers["_" + key]
                     }
                 }
+                if (typeof i.layers.default !== 'string')
+                    return;
+
                 let params = {
                     x_expand: true,
                     y_expand: true
@@ -1068,10 +1199,10 @@ class Keyboard extends Dialog {
                 if (this.settings.get_boolean("show-icons")) {
                     iconKeys = ["left", "up", "right", "down", "backspace", "tab", "capslock", "shift", "enter", "ctrl", "super", "alt", "space", "menu"]
                 }
-                // [insert handwriting 8]
-                if (iconKeys.some(j => { return i.layers.default.toLowerCase() == j })) {
-                    params.style_class = i.layers.default.toLowerCase() + "_btn"
-                    for (var key of Object.keys(i.layers)) {
+                const defaultLayer = i.layers.default.toLowerCase();
+                if (iconKeys.some(j => { return defaultLayer == j })) {
+                    params.style_class = defaultLayer + "_btn"
+                    for (const key of Object.keys(i.layers)) {
                         i.layers["_" + key] = i.layers[key]
                         i.layers[key] = null
                     }
@@ -1079,30 +1210,29 @@ class Keyboard extends Dialog {
                     params.label = i.layers.default
                 }
                 i.isMod = false
-                if ([42, 54, 29, 125, 126, 56, 100, 97, 58, 69].some(j => { return i.code == j })) {
+                if (MODIFIER_KEY_CODES.has(i.code)) {
                     i.isMod = true;
                 }
                 const keyBtn = new St.Button(params)
                 keyBtn.add_style_class_name('key')
                 keyBtn.char = i
-                if (i.code == 58) {
+                if (i.code === KeyCode.CAPS_LOCK) {
                     this.capslockConnect = this.keymap.connect("state-changed", (a, e) => {
                         this.setCapsLock(keyBtn, this.keymap.get_caps_lock_state())
                     })
                     this.updateCapsLock = () => this.setCapsLock(keyBtn, this.keymap.get_caps_lock_state())
-                } else if (i.code == 69) {
+                } else if (i.code === KeyCode.NUM_LOCK) {
                     this.numLockConnect = this.keymap.connect("state-changed", (a, e) => {
                         this.setNumLock(keyBtn, this.keymap.get_num_lock_state())
                     })
                     this.updateNumLock = () => this.setNumLock(keyBtn, this.keymap.get_num_lock_state())
-                } else if (i.code == 42 || i.code == 54) {
+                } else if (i.code === KeyCode.LEFT_SHIFT || i.code === KeyCode.RIGHT_SHIFT) {
                     this.shiftButtons.push(keyBtn)
                 }
                 currentGrid.attach(keyBtn, c, 5 + r, (("width" in keydef) ? keydef.width : 1) * 2, r == 0 ? 3 : (("height" in keydef) ? keydef.height : 1) * 4)
                 keyBtn.visible = true
                 c += (("width" in keydef) ? keydef.width : 1) * 2
                 this.keys.push(keyBtn)
-                // [insert handwriting 9]
             } else if (i == "empty space") {
                 c += (("width" in keydef) ? keydef.width : 1) * 2
             } else if (i == "split") {
@@ -1145,8 +1275,9 @@ class Keyboard extends Dialog {
                     right.set_style("background-color: st-lighten(-st-accent-color, 10%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
                 }
             } else {
-                left.set_style("background-color: rgba(" + this.settings.get_double("background-r" + this.settings.scheme) + "," + this.settings.get_double("background-g" + this.settings.scheme) + "," + this.settings.get_double("background-b" + this.settings.scheme) + ", " + this.settings.get_double("background-a" + this.settings.scheme) + "); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
-                right.set_style("background-color: rgba(" + this.settings.get_double("background-r" + this.settings.scheme) + "," + this.settings.get_double("background-g" + this.settings.scheme) + "," + this.settings.get_double("background-b" + this.settings.scheme) + ", " + this.settings.get_double("background-a" + this.settings.scheme) + "); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
+                const backgroundStyle = this.getKeyboardBackgroundStyle();
+                left.set_style(backgroundStyle)
+                right.set_style(backgroundStyle)
             }
             if (this.lightOrDark()) {
                 left.add_style_class_name("inverted");
@@ -1169,7 +1300,7 @@ class Keyboard extends Dialog {
                     this.settingsOpenFunction();
                 })
                 settingsBtn.connect("touch-event", (_actor, event) => {
-                    if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    if (event.type() === Clutter.EventType.TOUCH_BEGIN) {
                         this.settingsOpenFunction();
                         return Clutter.EVENT_STOP;
                     }
@@ -1193,7 +1324,7 @@ class Keyboard extends Dialog {
                     this.close();
                 })
                 closeBtn.connect("touch-event", (_actor, event) => {
-                    if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    if (event.type() === Clutter.EventType.TOUCH_BEGIN) {
                         this.closedFromButton = true;
                         this.close();
                         return Clutter.EVENT_STOP;
@@ -1211,7 +1342,7 @@ class Keyboard extends Dialog {
                 y_expand: true
             })
             moveHandleLeft.add_style_class_name("moveHandle")
-            moveHandleLeft.set_style("font-size: " + this.settings.get_int("font-size-px") + "px; border-radius: " + (this.settings.get_boolean("round-key-corners") ? "5px" : "0") + "; background-size: " + this.settings.get_int("font-size-px") + "px; font-weight: " + (this.settings.get_boolean("font-bold") ? "bold" : "normal") + "; border: " + this.settings.get_int("border-spacing-px") + "px solid transparent;");
+            moveHandleLeft.set_style(this.getMoveHandleStyle());
             if (this.lightOrDark()) {
                 moveHandleLeft.add_style_class_name("inverted");
             } else {
@@ -1226,7 +1357,7 @@ class Keyboard extends Dialog {
                 y_expand: true
             })
             moveHandleRight.add_style_class_name("moveHandle")
-            moveHandleRight.set_style("font-size: " + this.settings.get_int("font-size-px") + "px; border-radius: " + (this.settings.get_boolean("round-key-corners") ? "5px" : "0") + "; background-size: " + this.settings.get_int("font-size-px") + "px; font-weight: " + (this.settings.get_boolean("font-bold") ? "bold" : "normal") + "; border: " + this.settings.get_int("border-spacing-px") + "px solid transparent;");
+            moveHandleRight.set_style(this.getMoveHandleStyle());
             if (this.lightOrDark()) {
                 moveHandleRight.add_style_class_name("inverted");
             } else {
@@ -1246,7 +1377,7 @@ class Keyboard extends Dialog {
                     this.box.set_style("background-color: st-lighten(-st-accent-color, 10%); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
                 }
             } else {
-                this.box.set_style("background-color: rgba(" + this.settings.get_double("background-r" + this.settings.scheme) + "," + this.settings.get_double("background-g" + this.settings.scheme) + "," + this.settings.get_double("background-b" + this.settings.scheme) + ", " + this.settings.get_double("background-a" + this.settings.scheme) + "); padding: " + this.settings.get_int("outer-spacing-px") + "px;")
+                this.box.set_style(this.getKeyboardBackgroundStyle())
             }
             if (this.lightOrDark()) {
                 this.box.add_style_class_name("inverted");
@@ -1268,7 +1399,7 @@ class Keyboard extends Dialog {
                     this.settingsOpenFunction();
                 })
                 settingsBtn.connect("touch-event", (_actor, event) => {
-                    if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    if (event.type() === Clutter.EventType.TOUCH_BEGIN) {
                         this.settingsOpenFunction();
                         return Clutter.EVENT_STOP;
                     }
@@ -1292,7 +1423,7 @@ class Keyboard extends Dialog {
                     this.close();
                 })
                 closeBtn.connect("touch-event", (_actor, event) => {
-                    if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                    if (event.type() === Clutter.EventType.TOUCH_BEGIN) {
                         this.closedFromButton = true;
                         this.close();
                         return Clutter.EVENT_STOP;
@@ -1305,14 +1436,12 @@ class Keyboard extends Dialog {
                 moveHandleEndRight = 0;
             }
 
-            // [insert handwriting 10]
-
             let moveHandle = new St.Button({
                 x_expand: true,
                 y_expand: true
             })
             moveHandle.add_style_class_name("moveHandle")
-            moveHandle.set_style("font-size: " + this.settings.get_int("font-size-px") + "px; border-radius: " + (this.settings.get_boolean("round-key-corners") ? "5px" : "0") + "; background-size: " + this.settings.get_int("font-size-px") + "px; font-weight: " + (this.settings.get_boolean("font-bold") ? "bold" : "normal") + "; border: " + this.settings.get_int("border-spacing-px") + "px solid transparent;");
+            moveHandle.set_style(this.getMoveHandleStyle());
             if (this.lightOrDark()) {
                 moveHandle.add_style_class_name("inverted");
             } else {
@@ -1320,12 +1449,12 @@ class Keyboard extends Dialog {
             }
 
             this.connectMoveHandle(moveHandle)
-            grid.attach(moveHandle, moveHandleStartLeft, 0, (rowSize - moveHandleStartLeft - moveHandleEndRight), 3) // [insert handwriting 11]
+            grid.attach(moveHandle, moveHandleStartLeft, 0, (rowSize - moveHandleStartLeft - moveHandleEndRight), 3)
             grid.attach(new St.Widget({ x_expand: true, y_expand: true }), 0, 3, rowSize, 1)
         }
 
         this.keys.forEach(item => {
-            item.set_style("font-size: " + this.settings.get_int("font-size-px") + "px; border-radius: " + (this.settings.get_boolean("round-key-corners") ? (this.settings.get_int("border-spacing-px") + 5) + "px" : "0") + "; background-size: " + this.settings.get_int("font-size-px") + "px; font-weight: " + (this.settings.get_boolean("font-bold") ? "bold" : "normal") + "; border: " + this.settings.get_int("border-spacing-px") + "px solid transparent;");
+            item.set_style(this.getKeyStyle());
             if (this.lightOrDark()) {
                 item.add_style_class_name("inverted");
             } else {
@@ -1380,7 +1509,6 @@ class Keyboard extends Dialog {
                     logError(e, "Failed to play GJS OSK key sound");
                 }
             };
-            const repeatableKeyCodes = [14, 103, 105, 106, 108, 111];
             const activateKey = (restoreModifiers = false) => {
                 const oldModBtns = restoreModifiers ? [...this.modBtns] : [];
                 if (!item.char.isMod) {
@@ -1389,7 +1517,7 @@ class Keyboard extends Dialog {
                     this.decideMod(item.char, item)
                 }
 
-                for (var i of oldModBtns) {
+                for (const i of oldModBtns) {
                     this.decideMod(i.char, i)
                 }
             };
@@ -1404,7 +1532,7 @@ class Keyboard extends Dialog {
                 playSound();
                 const shouldRepeat = !item.char.isMod &&
                     ((this.settings.get_boolean("enable-key-repeat") && item.char != null) ||
-                        repeatableKeyCodes.includes(item.char.code) ||
+                        REPEATABLE_KEY_CODES.has(item.char.code) ||
                         ["delete_btn", "backspace_btn", "up_btn", "down_btn", "left_btn", "right_btn"].some(e => item.has_style_class_name(e)));
                 if (shouldRepeat) {
                     activateKey(true);
@@ -1422,9 +1550,9 @@ class Keyboard extends Dialog {
                         let handleSpaceMotion = absX => {
                             if (Math.abs(absX - lastPos) > 20) {
                                 if (absX > lastPos) {
-                                    this.sendKey([106])
+                                    this.sendKey([KeyCode.RIGHT])
                                 } else {
-                                    this.sendKey([105])
+                                    this.sendKey([KeyCode.LEFT])
                                 }
                                 lastPos = absX
                             }
@@ -1433,7 +1561,7 @@ class Keyboard extends Dialog {
                             handleSpaceMotion(event.get_coords()[0]);
                         })
                         item.space_touch_handler = item.connect("touch_event", (actor, event) => {
-                            if (event.type() == Clutter.EventType.TOUCH_UPDATE)
+                            if (event.type() === Clutter.EventType.TOUCH_UPDATE)
                                 handleSpaceMotion(event.get_coords()[0]);
                         })
                     }, 750)
@@ -1504,11 +1632,12 @@ class Keyboard extends Dialog {
             })
             item.add_action(pressGesture);
             item.connect("touch-event", (_actor, event) => {
-                if (event.type() == Clutter.EventType.TOUCH_BEGIN) {
+                const eventType = event.type();
+                if (eventType === Clutter.EventType.TOUCH_BEGIN) {
                     item._touchPressed = true;
                     pressEv();
                     return Clutter.EVENT_STOP;
-                } else if ((event.type() == Clutter.EventType.TOUCH_END || event.type() == Clutter.EventType.TOUCH_CANCEL) && item._touchPressed) {
+                } else if ((eventType === Clutter.EventType.TOUCH_END || eventType === Clutter.EventType.TOUCH_CANCEL) && item._touchPressed) {
                     item._touchPressed = false;
                     item._ignoreNextGestureRelease = true;
                     releaseEv();
@@ -1528,8 +1657,7 @@ class Keyboard extends Dialog {
             g = this.settings.get_double("background-g" + this.settings.scheme);
             b = this.settings.get_double("background-b" + this.settings.scheme);
         }
-        var hsp;
-        hsp = Math.sqrt(
+        const hsp = Math.sqrt(
             0.299 * (r * r) +
             0.587 * (g * g) +
             0.114 * (b * b)
@@ -1597,12 +1725,12 @@ class Keyboard extends Dialog {
 
             this.keyInProgress = true;
             const eventTime = this.getEventTime();
-            for (var i = 0; i < keys.length; i++) {
+            for (let i = 0; i < keys.length; i++) {
                 this.inputDevice.notify_key(eventTime, keys[i], Clutter.KeyState.PRESSED);
             }
 
             this.keyTimeoutFunc = () => {
-                for (var j = keys.length - 1; j >= 0; j--) {
+                for (let j = keys.length - 1; j >= 0; j--) {
                     this.inputDevice.notify_key(eventTime, keys[j], Clutter.KeyState.RELEASED);
                 }
                 this.keyInProgress = false;
@@ -1617,13 +1745,14 @@ class Keyboard extends Dialog {
     }
 
     decideMod(i, mBtn) {
-        if (i.code == 29 || i.code == 56 || i.code == 97 || i.code == 125 || i.code == 126) {
+        if (i.code === KeyCode.LEFT_CTRL || i.code === KeyCode.LEFT_ALT || i.code === KeyCode.RIGHT_CTRL ||
+            i.code === KeyCode.LEFT_SUPER || i.code === KeyCode.RIGHT_SUPER) {
             this.setNormMod(mBtn);
-        } else if (i.code == 100) {
+        } else if (i.code === KeyCode.RIGHT_ALT) {
             this.setAlt(mBtn);
-        } else if (i.code == 42 || i.code == 54) {
+        } else if (i.code === KeyCode.LEFT_SHIFT || i.code === KeyCode.RIGHT_SHIFT) {
             this.setShift(mBtn);
-        } else if (i.code == 58 || i.code == 69) {
+        } else if (i.code === KeyCode.CAPS_LOCK || i.code === KeyCode.NUM_LOCK) {
             this.sendKey([mBtn.char.code]);
         } else {
             this.mod.push(i.code);
@@ -1697,7 +1826,7 @@ class Keyboard extends Dialog {
             const modIndex = this.mod.indexOf(button.char.code);
             if (modIndex >= 0)
                 this.mod.splice(modIndex, 1);
-            if (!(button.char.code == 42) && !(button.char.code == 54))
+            if (button.char.code !== KeyCode.LEFT_SHIFT && button.char.code !== KeyCode.RIGHT_SHIFT)
                 button.remove_style_class_name("selected");
             const buttonIndex = this.modBtns.indexOf(button);
             if (buttonIndex >= 0)
@@ -1705,7 +1834,7 @@ class Keyboard extends Dialog {
             this.inputDevice.notify_key(this.getEventTime(), button.char.code, Clutter.KeyState.RELEASED);
             this.sendKey([button.char.code])
         } else {
-            if (!(button.char.code == 42) && !(button.char.code == 54))
+            if (button.char.code !== KeyCode.LEFT_SHIFT && button.char.code !== KeyCode.RIGHT_SHIFT)
                 button.add_style_class_name("selected");
             this.mod.push(button.char.code);
             this.modBtns.push(button);
